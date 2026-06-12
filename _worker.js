@@ -11,6 +11,8 @@ const DEFAULT_CONFIG = {
 	subUpdateTime: 6, //自定义订阅更新时间，单位小时
 	subRetry: 1, //订阅链接失败后的重试次数
 	subTimeout: 5000, //单个订阅链接请求超时时间，单位毫秒
+	subApiTimeout: 8000, //订阅转换后端请求超时时间，单位毫秒
+	subCache: 300, //订阅结果缓存时间，单位秒
 	totalTB: 99,
 	timestamp: 4102329600000, //2099-12-31
 };
@@ -22,6 +24,7 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
+const CUSTOM_FIX_VERSION = "custom-fix-2026-06-12-cache-subapi-timeout";
 const BYTES_PER_TB = 1099511627776;
 
 function normalizeSubConverter(rawValue) {
@@ -61,6 +64,41 @@ function runInBackground(ctx, promise, DEBUG = false) {
 	if (ctx?.waitUntil) ctx.waitUntil(task);
 }
 
+function runtimeHeaders(headers = {}, extra = {}) {
+	const result = new Headers(headers);
+	result.set("X-Custom-Fix-Version", CUSTOM_FIX_VERSION);
+	for (const [key, value] of Object.entries(extra)) result.set(key, value);
+	return result;
+}
+
+async function getSubscriptionCache(cacheKey, DEBUG = false) {
+	if (!cacheKey || typeof caches === 'undefined') return null;
+	const cached = await caches.default.match(cacheKey);
+	if (!cached) return null;
+	debugLog(DEBUG, `订阅缓存命中: ${cacheKey.url}`);
+	const headers = runtimeHeaders(cached.headers, { "X-Sub-Cache": "HIT" });
+	return new Response(cached.body, { status: cached.status, statusText: cached.statusText, headers });
+}
+
+function storeSubscriptionCache(cacheKey, response, subCache, ctx, DEBUG = false) {
+	if (!cacheKey || !subCache || typeof caches === 'undefined' || response.status !== 200) return response;
+	const cacheHeaders = runtimeHeaders(response.headers, {
+		"Cache-Control": `public, max-age=${subCache}`,
+		"X-Sub-Cache": "MISS",
+	});
+	const cacheableResponse = new Response(response.clone().body, {
+		status: response.status,
+		statusText: response.statusText,
+		headers: cacheHeaders,
+	});
+	runInBackground(ctx, caches.default.put(cacheKey, cacheableResponse.clone()), DEBUG);
+	return new Response(response.body, {
+		status: response.status,
+		statusText: response.statusText,
+		headers: cacheHeaders,
+	});
+}
+
 export default {
 	async fetch(request, env, ctx) {
 		const userAgentHeader = request.headers.get('User-Agent');
@@ -73,12 +111,13 @@ export default {
 		const ChatID = env.TGID || DEFAULT_CONFIG.chatID;
 		const TG = Number(env.TG ?? DEFAULT_CONFIG.tg);
 		const subConverters = normalizeSubConverters(env.SUBAPI || DEFAULT_SUB_CONVERTER);
-		const { subProtocol, subConverter } = subConverters[0];
 		const subConverterDisplay = subConverters.map(item => `${item.subProtocol}://${item.subConverter}`).join(', ');
 		const subConfig = env.SUBCONFIG || DEFAULT_SUB_CONFIG;
 		const FileName = env.SUBNAME || DEFAULT_CONFIG.fileName;
 		const subRetry = normalizeNumber(env.SUBRETRY, DEFAULT_CONFIG.subRetry, 0, 5);
 		const subTimeout = normalizeNumber(env.SUBTIMEOUT, DEFAULT_CONFIG.subTimeout, 1000, 30000);
+		const subApiTimeout = normalizeNumber(env.SUBAPITIMEOUT, DEFAULT_CONFIG.subApiTimeout, 1000, 30000);
+		const subCache = normalizeNumber(env.SUBCACHE, DEFAULT_CONFIG.subCache, 0, 3600);
 
 		const currentDate = new Date();
 		currentDate.setHours(0, 0, 0, 0);
@@ -105,9 +144,9 @@ export default {
 			else if (env.URL) return await proxyURL(env.URL, url, DEBUG);
 			else return new Response(await nginx(), {
 				status: 200,
-				headers: {
+				headers: runtimeHeaders({
 					'Content-Type': 'text/html; charset=UTF-8',
-				},
+				}),
 			});
 		} else {
 			let MainData = DEFAULT_MAIN_DATA;
@@ -166,6 +205,21 @@ export default {
 			else if (url.searchParams.has('quanx')) 追加UA = 'Quantumult%20X';
 			else if (url.searchParams.has('loon')) 追加UA = 'Loon';
 
+			const cacheSeed = [
+				request.url,
+				订阅格式,
+				MainData,
+				urls.join('\n'),
+				env.WARP || '',
+				subConverterDisplay,
+				subConfig,
+			].join('\n---\n');
+			const cacheKey = request.method === "GET" && subCache > 0
+				? new Request(`${url.origin}/__sub-cache/${await MD5MD5(cacheSeed)}`, { method: "GET" })
+				: null;
+			const cachedResponse = await getSubscriptionCache(cacheKey, DEBUG);
+			if (cachedResponse) return cachedResponse;
+
 			const 订阅链接数组 = [...new Set(urls)].filter(item => item?.trim?.()); // 去重
 			if (订阅链接数组.length > 0) {
 				const 请求订阅响应内容 = await getSUB(订阅链接数组, 追加UA, userAgentHeader, { DEBUG, subRetry, subTimeout });
@@ -174,7 +228,7 @@ export default {
 				订阅转换URL += "|" + 请求订阅响应内容[1];
 				if (订阅格式 == 'base64' && !isSubConverterRequest && 请求订阅响应内容[1].includes('://')) {
 					try {
-						const subConverterContent = await fetchSubConverterText(subConverters, converter => buildSubConverterUrl(converter, 'mixed', 请求订阅响应内容[1], subConfig), { 'User-Agent': 'v2rayN/CF-Workers-SUB  (https://github.com/cmliu/CF-Workers-SUB)' }, DEBUG);
+						const subConverterContent = await fetchSubConverterText(subConverters, converter => buildSubConverterUrl(converter, 'mixed', 请求订阅响应内容[1], subConfig), { 'User-Agent': 'v2rayN/CF-Workers-SUB  (https://github.com/cmliu/CF-Workers-SUB)' }, { DEBUG, subApiTimeout });
 						req_data += '\n' + atob(subConverterContent);
 					} catch (error) {
 						debugLog(DEBUG, '订阅转换请回base64失败，检查订阅转换后端是否正常运行', error);
@@ -231,7 +285,8 @@ export default {
 			};
 
 			if (订阅格式 == 'base64' || token == fakeToken) {
-				return new Response(base64Data, { headers: responseHeaders });
+				const response = new Response(base64Data, { headers: runtimeHeaders(responseHeaders) });
+				return storeSubscriptionCache(cacheKey, response, subCache, ctx, DEBUG);
 			} else if (订阅格式 == 'clash') {
 				subConverterUrl = converter => buildSubConverterUrl(converter, 'clash', 订阅转换URL, subConfig);
 			} else if (订阅格式 == 'singbox') {
@@ -245,13 +300,15 @@ export default {
 			}
 			//console.log(订阅转换URL);
 			try {
-				let subConverterContent = await fetchSubConverterText(subConverters, subConverterUrl, { 'User-Agent': userAgentHeader }, DEBUG);//订阅转换
+				let subConverterContent = await fetchSubConverterText(subConverters, subConverterUrl, { 'User-Agent': userAgentHeader }, { DEBUG, subApiTimeout });//订阅转换
 				if (订阅格式 == 'clash') subConverterContent = await clashFix(subConverterContent);
 				// 只有非浏览器订阅才会返回SUBNAME
-				if (!userAgent.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(FileName)}`;
-				return new Response(subConverterContent, { headers: responseHeaders });
+				const headers = runtimeHeaders(responseHeaders);
+				if (!userAgent.includes('mozilla')) headers.set("Content-Disposition", `attachment; filename*=utf-8''${encodeURIComponent(FileName)}`);
+				const response = new Response(subConverterContent, { headers });
+				return storeSubscriptionCache(cacheKey, response, subCache, ctx, DEBUG);
 			} catch (error) {
-				return new Response(base64Data, { headers: responseHeaders });
+				return new Response(base64Data, { headers: runtimeHeaders(responseHeaders, { "X-Sub-Cache": "BYPASS" }) });
 			}
 		}
 	}
@@ -383,18 +440,23 @@ function buildSubConverterUrl(converter, target, sourceUrl, subConfig, extraQuer
 	return `${converter.subProtocol}://${converter.subConverter}/sub?target=${target}${extra}&url=${encodeURIComponent(sourceUrl)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false&new_name=true`;
 }
 
-async function fetchSubConverterText(converters, buildUrl, headers, DEBUG = false) {
+async function fetchSubConverterText(converters, buildUrl, headers, options = {}) {
+	const { DEBUG = false, subApiTimeout = DEFAULT_CONFIG.subApiTimeout } = options;
 	let lastError;
 	for (const converter of converters) {
 		const converterUrl = buildUrl(converter);
+		const controller = new AbortController();
+		const timeout = setTimeout(() => controller.abort(), subApiTimeout);
 		try {
-			const response = await fetch(converterUrl, { headers });
+			const response = await fetch(converterUrl, { headers, signal: controller.signal });
 			if (!response.ok) throw new Error(`HTTP ${response.status}`);
 			debugLog(DEBUG, `订阅转换成功: ${converter.subProtocol}://${converter.subConverter}`);
 			return await response.text();
 		} catch (error) {
 			lastError = error;
 			debugLog(DEBUG, `订阅转换失败: ${converterUrl}`, error);
+		} finally {
+			clearTimeout(timeout);
 		}
 	}
 	throw lastError || new Error('所有订阅转换后端均不可用');
@@ -728,6 +790,7 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 					---------------------------------------------------------------<br>
 					SUBAPI（订阅转换后端）: <strong>${subConverterDisplay}</strong><br>
 					SUBCONFIG（订阅转换配置文件）: <strong>${subConfig}</strong><br>
+					VERSION（部署标记）: <strong>${CUSTOM_FIX_VERSION}</strong><br>
 					---------------------------------------------------------------<br>
 					################################################################<br>
 					${FileName} 汇聚订阅编辑: 
@@ -904,13 +967,13 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 		`;
 
 		return new Response(html, {
-			headers: { "Content-Type": "text/html;charset=utf-8" }
+			headers: runtimeHeaders({ "Content-Type": "text/html;charset=utf-8" })
 		});
 	} catch (error) {
 		console.error('处理请求时发生错误:', error);
 		return new Response("服务器错误: " + error.message, {
 			status: 500,
-			headers: { "Content-Type": "text/plain;charset=utf-8" }
+			headers: runtimeHeaders({ "Content-Type": "text/plain;charset=utf-8" })
 		});
 	}
 }
