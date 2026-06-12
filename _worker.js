@@ -25,10 +25,21 @@ const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main
 const BYTES_PER_TB = 1099511627776;
 
 function normalizeSubConverter(rawValue) {
-	const value = (rawValue || DEFAULT_SUB_CONVERTER).trim();
+	const value = String(rawValue || DEFAULT_SUB_CONVERTER).trim();
 	if (value.startsWith('http://')) return { subProtocol: 'http', subConverter: value.slice('http://'.length).replace(/\/+$/, '') };
 	if (value.startsWith('https://')) return { subProtocol: 'https', subConverter: value.slice('https://'.length).replace(/\/+$/, '') };
 	return { subProtocol: 'https', subConverter: value.replace(/\/+$/, '') };
+}
+
+function normalizeSubConverters(rawValue) {
+	const values = String(rawValue || DEFAULT_SUB_CONVERTER)
+		.split(/[\n,|]+/)
+		.map(value => value.trim())
+		.filter(Boolean);
+	return [...new Map(values.map(value => {
+		const converter = normalizeSubConverter(value);
+		return [`${converter.subProtocol}://${converter.subConverter}`, converter];
+	})).values()];
 }
 
 function isDebugEnabled(env) {
@@ -61,7 +72,9 @@ export default {
 		const BotToken = env.TGTOKEN || DEFAULT_CONFIG.botToken;
 		const ChatID = env.TGID || DEFAULT_CONFIG.chatID;
 		const TG = Number(env.TG ?? DEFAULT_CONFIG.tg);
-		const { subProtocol, subConverter } = normalizeSubConverter(env.SUBAPI || DEFAULT_SUB_CONVERTER);
+		const subConverters = normalizeSubConverters(env.SUBAPI || DEFAULT_SUB_CONVERTER);
+		const { subProtocol, subConverter } = subConverters[0];
+		const subConverterDisplay = subConverters.map(item => `${item.subProtocol}://${item.subConverter}`).join(', ');
 		const subConfig = env.SUBCONFIG || DEFAULT_SUB_CONFIG;
 		const FileName = env.SUBNAME || DEFAULT_CONFIG.fileName;
 		const subRetry = normalizeNumber(env.SUBRETRY, DEFAULT_CONFIG.subRetry, 0, 5);
@@ -103,7 +116,7 @@ export default {
 				await 迁移地址列表(env, 'LINK.txt');
 				if (userAgent.includes('mozilla') && !url.search) {
 					runInBackground(ctx, sendMessage(`#编辑订阅 ${FileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgentHeader}</tg-spoiler>\n域名: ${url.hostname}\n<tg-spoiler>入口: ${url.pathname + url.search}</tg-spoiler>`, { BotToken, ChatID }), DEBUG);
-					return await KV(request, env, 'LINK.txt', 访客订阅, { FileName, mytoken, subProtocol, subConverter, subConfig });
+					return await KV(request, env, 'LINK.txt', 访客订阅, { FileName, mytoken, subConverterDisplay, subConfig });
 				} else {
 					MainData = await env.KV.get('LINK.txt') || DEFAULT_MAIN_DATA;
 				}
@@ -160,13 +173,9 @@ export default {
 				req_data += 请求订阅响应内容[0].join('\n');
 				订阅转换URL += "|" + 请求订阅响应内容[1];
 				if (订阅格式 == 'base64' && !isSubConverterRequest && 请求订阅响应内容[1].includes('://')) {
-					subConverterUrl = `${subProtocol}://${subConverter}/sub?target=mixed&url=${encodeURIComponent(请求订阅响应内容[1])}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false&new_name=true`;
 					try {
-						const subConverterResponse = await fetch(subConverterUrl, { headers: { 'User-Agent': 'v2rayN/CF-Workers-SUB  (https://github.com/cmliu/CF-Workers-SUB)' } });
-						if (subConverterResponse.ok) {
-							const subConverterContent = await subConverterResponse.text();
-							req_data += '\n' + atob(subConverterContent);
-						}
+						const subConverterContent = await fetchSubConverterText(subConverters, converter => buildSubConverterUrl(converter, 'mixed', 请求订阅响应内容[1], subConfig), { 'User-Agent': 'v2rayN/CF-Workers-SUB  (https://github.com/cmliu/CF-Workers-SUB)' }, DEBUG);
+						req_data += '\n' + atob(subConverterContent);
 					} catch (error) {
 						debugLog(DEBUG, '订阅转换请回base64失败，检查订阅转换后端是否正常运行', error);
 					}
@@ -224,21 +233,19 @@ export default {
 			if (订阅格式 == 'base64' || token == fakeToken) {
 				return new Response(base64Data, { headers: responseHeaders });
 			} else if (订阅格式 == 'clash') {
-				subConverterUrl = `${subProtocol}://${subConverter}/sub?target=clash&url=${encodeURIComponent(订阅转换URL)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false&new_name=true`;
+				subConverterUrl = converter => buildSubConverterUrl(converter, 'clash', 订阅转换URL, subConfig);
 			} else if (订阅格式 == 'singbox') {
-				subConverterUrl = `${subProtocol}://${subConverter}/sub?target=singbox&url=${encodeURIComponent(订阅转换URL)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false&new_name=true`;
+				subConverterUrl = converter => buildSubConverterUrl(converter, 'singbox', 订阅转换URL, subConfig);
 			} else if (订阅格式 == 'surge') {
-				subConverterUrl = `${subProtocol}://${subConverter}/sub?target=surge&ver=4&url=${encodeURIComponent(订阅转换URL)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false&new_name=true`;
+				subConverterUrl = converter => buildSubConverterUrl(converter, 'surge', 订阅转换URL, subConfig, 'ver=4');
 			} else if (订阅格式 == 'quanx') {
-				subConverterUrl = `${subProtocol}://${subConverter}/sub?target=quanx&url=${encodeURIComponent(订阅转换URL)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false&udp=true`;
+				subConverterUrl = converter => buildSubConverterUrl(converter, 'quanx', 订阅转换URL, subConfig, 'udp=true');
 			} else if (订阅格式 == 'loon') {
-				subConverterUrl = `${subProtocol}://${subConverter}/sub?target=loon&url=${encodeURIComponent(订阅转换URL)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false`;
+				subConverterUrl = converter => buildSubConverterUrl(converter, 'loon', 订阅转换URL, subConfig);
 			}
 			//console.log(订阅转换URL);
 			try {
-				const subConverterResponse = await fetch(subConverterUrl, { headers: { 'User-Agent': userAgentHeader } });//订阅转换
-				if (!subConverterResponse.ok) return new Response(base64Data, { headers: responseHeaders });
-				let subConverterContent = await subConverterResponse.text();
+				let subConverterContent = await fetchSubConverterText(subConverters, subConverterUrl, { 'User-Agent': userAgentHeader }, DEBUG);//订阅转换
 				if (订阅格式 == 'clash') subConverterContent = await clashFix(subConverterContent);
 				// 只有非浏览器订阅才会返回SUBNAME
 				if (!userAgent.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(FileName)}`;
@@ -369,6 +376,28 @@ function clashFix(content) {
 		content = result;
 	}
 	return content;
+}
+
+function buildSubConverterUrl(converter, target, sourceUrl, subConfig, extraQuery = '') {
+	const extra = extraQuery ? `&${extraQuery}` : '';
+	return `${converter.subProtocol}://${converter.subConverter}/sub?target=${target}${extra}&url=${encodeURIComponent(sourceUrl)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false&new_name=true`;
+}
+
+async function fetchSubConverterText(converters, buildUrl, headers, DEBUG = false) {
+	let lastError;
+	for (const converter of converters) {
+		const converterUrl = buildUrl(converter);
+		try {
+			const response = await fetch(converterUrl, { headers });
+			if (!response.ok) throw new Error(`HTTP ${response.status}`);
+			debugLog(DEBUG, `订阅转换成功: ${converter.subProtocol}://${converter.subConverter}`);
+			return await response.text();
+		} catch (error) {
+			lastError = error;
+			debugLog(DEBUG, `订阅转换失败: ${converterUrl}`, error);
+		}
+	}
+	throw lastError || new Error('所有订阅转换后端均不可用');
 }
 
 async function proxyURL(proxyURL, url, DEBUG = false) {
@@ -554,7 +583,7 @@ async function 迁移地址列表(env, txt = 'ADD.txt') {
 }
 
 async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
-	const { FileName = DEFAULT_CONFIG.fileName, mytoken = DEFAULT_CONFIG.token, subProtocol = 'https', subConverter = DEFAULT_SUB_CONVERTER, subConfig = DEFAULT_SUB_CONFIG } = config;
+	const { FileName = DEFAULT_CONFIG.fileName, mytoken = DEFAULT_CONFIG.token, subConverterDisplay = `https://${DEFAULT_SUB_CONVERTER}`, subConfig = DEFAULT_SUB_CONFIG } = config;
 	const url = new URL(request.url);
 	try {
 		// POST请求处理
@@ -697,7 +726,7 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 					################################################################<br>
 					订阅转换配置<br>
 					---------------------------------------------------------------<br>
-					SUBAPI（订阅转换后端）: <strong>${subProtocol}://${subConverter}</strong><br>
+					SUBAPI（订阅转换后端）: <strong>${subConverterDisplay}</strong><br>
 					SUBCONFIG（订阅转换配置文件）: <strong>${subConfig}</strong><br>
 					---------------------------------------------------------------<br>
 					################################################################<br>
