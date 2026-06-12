@@ -9,6 +9,8 @@ const DEFAULT_CONFIG = {
 	tg: 0, //小白勿动， 开发者专用，1 为推送所有的访问信息，0 为不推送订阅转换后端的访问信息与异常访问
 	fileName: 'CF-Workers-SUB',
 	subUpdateTime: 6, //自定义订阅更新时间，单位小时
+	subRetry: 1, //订阅链接失败后的重试次数
+	subTimeout: 5000, //单个订阅链接请求超时时间，单位毫秒
 	totalTB: 99,
 	timestamp: 4102329600000, //2099-12-31
 };
@@ -37,6 +39,12 @@ function debugLog(debug, ...args) {
 	if (debug) console.log(...args);
 }
 
+function normalizeNumber(value, fallback, min, max) {
+	const number = Number(value);
+	if (!Number.isFinite(number)) return fallback;
+	return Math.min(max, Math.max(min, Math.floor(number)));
+}
+
 function runInBackground(ctx, promise, DEBUG = false) {
 	const task = Promise.resolve(promise).catch(error => debugLog(DEBUG, error));
 	if (ctx?.waitUntil) ctx.waitUntil(task);
@@ -56,6 +64,8 @@ export default {
 		const { subProtocol, subConverter } = normalizeSubConverter(env.SUBAPI || DEFAULT_SUB_CONVERTER);
 		const subConfig = env.SUBCONFIG || DEFAULT_SUB_CONFIG;
 		const FileName = env.SUBNAME || DEFAULT_CONFIG.fileName;
+		const subRetry = normalizeNumber(env.SUBRETRY, DEFAULT_CONFIG.subRetry, 0, 5);
+		const subTimeout = normalizeNumber(env.SUBTIMEOUT, DEFAULT_CONFIG.subTimeout, 1000, 30000);
 
 		const currentDate = new Date();
 		currentDate.setHours(0, 0, 0, 0);
@@ -145,7 +155,7 @@ export default {
 
 			const 订阅链接数组 = [...new Set(urls)].filter(item => item?.trim?.()); // 去重
 			if (订阅链接数组.length > 0) {
-				const 请求订阅响应内容 = await getSUB(订阅链接数组, request, 追加UA, userAgentHeader, DEBUG);
+				const 请求订阅响应内容 = await getSUB(订阅链接数组, 追加UA, userAgentHeader, { DEBUG, subRetry, subTimeout });
 				debugLog(DEBUG, 请求订阅响应内容);
 				req_data += 请求订阅响应内容[0].join('\n');
 				订阅转换URL += "|" + 请求订阅响应内容[1];
@@ -401,21 +411,18 @@ async function proxyURL(proxyURL, url, DEBUG = false) {
 	return newResponse;
 }
 
-async function getSUB(api, request, 追加UA, userAgentHeader, DEBUG = false) {
+async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
+	const { DEBUG = false, subRetry = DEFAULT_CONFIG.subRetry, subTimeout = DEFAULT_CONFIG.subTimeout } = options;
 	if (!api || api.length === 0) {
 		return [];
 	} else api = [...new Set(api)]; // 去重
 	let newapi = "";
 	let 订阅转换URLs = "";
 	let 异常订阅 = "";
-	const controller = new AbortController(); // 创建一个AbortController实例，用于取消请求
-	const timeout = setTimeout(() => {
-		controller.abort(); // 2秒后取消所有请求
-	}, 2000);
 
 	try {
 		// 使用Promise.allSettled等待所有API请求完成，无论成功或失败
-		const responses = await Promise.allSettled(api.map(apiUrl => getUrl(apiUrl, 追加UA, userAgentHeader, controller.signal, DEBUG).then(response => response.ok ? response.text() : Promise.reject(response))));
+		const responses = await Promise.allSettled(api.map(apiUrl => fetchSubscription(apiUrl, 追加UA, userAgentHeader, { DEBUG, subRetry, subTimeout })));
 
 		// 遍历所有响应
 		const modifiedResponses = responses.map((response, index) => {
@@ -473,13 +480,32 @@ async function getSUB(api, request, 追加UA, userAgentHeader, DEBUG = false) {
 		}
 	} catch (error) {
 		debugLog(DEBUG, error); // 捕获并输出错误信息
-	} finally {
-		clearTimeout(timeout); // 清除定时器
 	}
 
 	const 订阅内容 = await ADD(newapi + 异常订阅); // 将处理后的内容转换为数组
 	// 返回处理后的结果
 	return [订阅内容, 订阅转换URLs];
+}
+
+async function fetchSubscription(targetUrl, 追加UA, userAgentHeader, options = {}) {
+	const { DEBUG = false, subRetry = DEFAULT_CONFIG.subRetry, subTimeout = DEFAULT_CONFIG.subTimeout } = options;
+	let lastError;
+	for (let attempt = 0; attempt <= subRetry; attempt++) {
+		const controller = new AbortController();
+		const timeout = setTimeout(() => controller.abort(), subTimeout);
+		try {
+			const response = await getUrl(targetUrl, 追加UA, userAgentHeader, controller.signal, DEBUG);
+			if (!response.ok) throw response;
+			return await response.text();
+		} catch (error) {
+			lastError = error;
+			debugLog(DEBUG, `订阅请求失败 ${targetUrl} attempt=${attempt + 1}/${subRetry + 1}`, error?.status || error?.name || error);
+			if (attempt >= subRetry) throw error;
+		} finally {
+			clearTimeout(timeout);
+		}
+	}
+	throw lastError;
 }
 
 async function getUrl(targetUrl, 追加UA, userAgentHeader, signal, DEBUG = false) {
