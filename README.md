@@ -107,6 +107,11 @@
 | SUBNAME | `CF-Workers-SUB` | ❌ | 订阅名称 |
 | SUBAPI | `SUBAPI.cmliussss.net` | ❌ | clash、singbox等 订阅转换后端 | 
 | SUBCONFIG | [https://raw.github.../ACL4SSR_Online_MultiCountry.ini](https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini) | ❌ | clash、singbox等 订阅转换配置文件 | 
+| SUBRETRY | `3` | ❌ | 订阅链接拉取失败后的重试次数，范围 `0-5` |
+| SUBTIMEOUT | `1500` | ❌ | 单个订阅链接请求超时时间，单位毫秒，范围 `1000-30000` |
+| SUBAPITIMEOUT | `8000` | ❌ | 订阅转换后端请求超时时间，单位毫秒，范围 `1000-30000` |
+| SUBCACHE | `300` | ❌ | 订阅结果缓存时间，单位秒；设为 `0` 可关闭缓存，范围 `0-3600` |
+| SHOW_FAILED_SUB | `0` | ❌ | 是否在订阅结果里显示异常订阅占位节点；`1/true/yes/on` 为开启 |
 
 
 ## ⚠️ 注意事项

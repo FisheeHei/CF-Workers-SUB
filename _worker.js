@@ -13,6 +13,7 @@ const DEFAULT_CONFIG = {
 	subTimeout: 5000, //单个订阅链接请求超时时间，单位毫秒
 	subApiTimeout: 8000, //订阅转换后端请求超时时间，单位毫秒
 	subCache: 300, //订阅结果缓存时间，单位秒
+	showFailedSub: false,
 	totalTB: 99,
 	timestamp: 4102329600000, //2099-12-31
 };
@@ -24,7 +25,7 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-06-12-cache-subapi-timeout";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-06-12-refresh-stats";
 const BYTES_PER_TB = 1099511627776;
 
 function normalizeSubConverter(rawValue) {
@@ -47,6 +48,12 @@ function normalizeSubConverters(rawValue) {
 
 function isDebugEnabled(env) {
 	return ['1', 'true', 'yes', 'on'].includes(String(env.DEBUG || '').toLowerCase());
+}
+
+function normalizeBoolean(value, fallback = false) {
+	if (value === undefined || value === null || value === '') return fallback;
+	if (typeof value === 'boolean') return value;
+	return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
 }
 
 function debugLog(debug, ...args) {
@@ -80,11 +87,11 @@ async function getSubscriptionCache(cacheKey, DEBUG = false) {
 	return new Response(cached.body, { status: cached.status, statusText: cached.statusText, headers });
 }
 
-function storeSubscriptionCache(cacheKey, response, subCache, ctx, DEBUG = false) {
+function storeSubscriptionCache(cacheKey, response, subCache, ctx, DEBUG = false, cacheState = "MISS") {
 	if (!cacheKey || !subCache || typeof caches === 'undefined' || response.status !== 200) return response;
 	const cacheHeaders = runtimeHeaders(response.headers, {
 		"Cache-Control": `public, max-age=${subCache}`,
-		"X-Sub-Cache": "MISS",
+		"X-Sub-Cache": cacheState,
 	});
 	const cacheableResponse = new Response(response.clone().body, {
 		status: response.status,
@@ -118,6 +125,8 @@ export default {
 		const subTimeout = normalizeNumber(env.SUBTIMEOUT, DEFAULT_CONFIG.subTimeout, 1000, 30000);
 		const subApiTimeout = normalizeNumber(env.SUBAPITIMEOUT, DEFAULT_CONFIG.subApiTimeout, 1000, 30000);
 		const subCache = normalizeNumber(env.SUBCACHE, DEFAULT_CONFIG.subCache, 0, 3600);
+		const showFailedSub = normalizeBoolean(env.SHOW_FAILED_SUB, DEFAULT_CONFIG.showFailedSub);
+		const refreshCache = url.searchParams.has('refresh');
 
 		const currentDate = new Date();
 		currentDate.setHours(0, 0, 0, 0);
@@ -155,7 +164,7 @@ export default {
 				await 迁移地址列表(env, 'LINK.txt');
 				if (userAgent.includes('mozilla') && !url.search) {
 					runInBackground(ctx, sendMessage(`#编辑订阅 ${FileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgentHeader}</tg-spoiler>\n域名: ${url.hostname}\n<tg-spoiler>入口: ${url.pathname + url.search}</tg-spoiler>`, { BotToken, ChatID }), DEBUG);
-					return await KV(request, env, 'LINK.txt', 访客订阅, { FileName, mytoken, subConverterDisplay, subConfig });
+					return await KV(request, env, 'LINK.txt', 访客订阅, { FileName, mytoken, subConverterDisplay, subConfig, subRetry, subTimeout, subApiTimeout, subCache, showFailedSub });
 				} else {
 					MainData = await env.KV.get('LINK.txt') || DEFAULT_MAIN_DATA;
 				}
@@ -205,8 +214,10 @@ export default {
 			else if (url.searchParams.has('quanx')) 追加UA = 'Quantumult%20X';
 			else if (url.searchParams.has('loon')) 追加UA = 'Loon';
 
+			const cacheUrl = new URL(request.url);
+			cacheUrl.searchParams.delete('refresh');
 			const cacheSeed = [
-				request.url,
+				cacheUrl.toString(),
 				订阅格式,
 				MainData,
 				urls.join('\n'),
@@ -217,12 +228,12 @@ export default {
 			const cacheKey = request.method === "GET" && subCache > 0
 				? new Request(`${url.origin}/__sub-cache/${await MD5MD5(cacheSeed)}`, { method: "GET" })
 				: null;
-			const cachedResponse = await getSubscriptionCache(cacheKey, DEBUG);
+			const cachedResponse = refreshCache ? null : await getSubscriptionCache(cacheKey, DEBUG);
 			if (cachedResponse) return cachedResponse;
 
 			const 订阅链接数组 = [...new Set(urls)].filter(item => item?.trim?.()); // 去重
 			if (订阅链接数组.length > 0) {
-				const 请求订阅响应内容 = await getSUB(订阅链接数组, 追加UA, userAgentHeader, { DEBUG, subRetry, subTimeout });
+				const 请求订阅响应内容 = await getSUB(订阅链接数组, 追加UA, userAgentHeader, { DEBUG, subRetry, subTimeout, showFailedSub });
 				debugLog(DEBUG, 请求订阅响应内容);
 				req_data += 请求订阅响应内容[0].join('\n');
 				订阅转换URL += "|" + 请求订阅响应内容[1];
@@ -286,7 +297,7 @@ export default {
 
 			if (订阅格式 == 'base64' || token == fakeToken) {
 				const response = new Response(base64Data, { headers: runtimeHeaders(responseHeaders) });
-				return storeSubscriptionCache(cacheKey, response, subCache, ctx, DEBUG);
+				return storeSubscriptionCache(cacheKey, response, subCache, ctx, DEBUG, refreshCache ? "REFRESH" : "MISS");
 			} else if (订阅格式 == 'clash') {
 				subConverterUrl = converter => buildSubConverterUrl(converter, 'clash', 订阅转换URL, subConfig);
 			} else if (订阅格式 == 'singbox') {
@@ -306,7 +317,7 @@ export default {
 				const headers = runtimeHeaders(responseHeaders);
 				if (!userAgent.includes('mozilla')) headers.set("Content-Disposition", `attachment; filename*=utf-8''${encodeURIComponent(FileName)}`);
 				const response = new Response(subConverterContent, { headers });
-				return storeSubscriptionCache(cacheKey, response, subCache, ctx, DEBUG);
+				return storeSubscriptionCache(cacheKey, response, subCache, ctx, DEBUG, refreshCache ? "REFRESH" : "MISS");
 			} catch (error) {
 				return new Response(base64Data, { headers: runtimeHeaders(responseHeaders, { "X-Sub-Cache": "BYPASS" }) });
 			}
@@ -314,13 +325,21 @@ export default {
 	}
 };
 
-async function ADD(envadd) {
+function splitLinkText(envadd) {
 	if (!envadd) return [];
-	var addtext = String(envadd).replace(/[	"'|\r\n]+/g, '\n').replace(/\n+/g, '\n');	// 替换为换行
-	//console.log(addtext);
-	if (addtext.charAt(0) == '\n') addtext = addtext.slice(1);
-	if (addtext.charAt(addtext.length - 1) == '\n') addtext = addtext.slice(0, addtext.length - 1);
-	const add = addtext.split('\n');
+	const addtext = String(envadd).replace(/[	"'|\r\n]+/g, '\n').replace(/\n+/g, '\n').trim();
+	if (!addtext) return [];
+	return addtext.split('\n').map(item => item.trim()).filter(Boolean);
+}
+
+function summarizeLinks(envadd) {
+	const lines = splitLinkText(envadd);
+	const remote = lines.filter(item => item.toLowerCase().startsWith('http')).length;
+	return { total: lines.length, remote, local: lines.length - remote };
+}
+
+async function ADD(envadd) {
+	const add = splitLinkText(envadd);
 	//console.log(add);
 	return add;
 }
@@ -503,7 +522,7 @@ async function proxyURL(proxyURL, url, DEBUG = false) {
 }
 
 async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
-	const { DEBUG = false, subRetry = DEFAULT_CONFIG.subRetry, subTimeout = DEFAULT_CONFIG.subTimeout } = options;
+	const { DEBUG = false, subRetry = DEFAULT_CONFIG.subRetry, subTimeout = DEFAULT_CONFIG.subTimeout, showFailedSub = DEFAULT_CONFIG.showFailedSub } = options;
 	if (!api || api.length === 0) {
 		return [];
 	} else api = [...new Set(api)]; // 去重
@@ -564,7 +583,7 @@ async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
 					} else {
 						const 异常订阅LINK = `trojan://CMLiussss@127.0.0.1:8888?security=tls&allowInsecure=1&type=tcp&headerType=none#%E5%BC%82%E5%B8%B8%E8%AE%A2%E9%98%85%20${response.apiUrl.split('://')[1].split('/')[0]}`;
 						debugLog(DEBUG, '异常订阅: ' + 异常订阅LINK);
-						异常订阅 += `${异常订阅LINK}\n`;
+						if (showFailedSub) 异常订阅 += `${异常订阅LINK}\n`;
 					}
 				}
 			}
@@ -645,7 +664,17 @@ async function 迁移地址列表(env, txt = 'ADD.txt') {
 }
 
 async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
-	const { FileName = DEFAULT_CONFIG.fileName, mytoken = DEFAULT_CONFIG.token, subConverterDisplay = `https://${DEFAULT_SUB_CONVERTER}`, subConfig = DEFAULT_SUB_CONFIG } = config;
+	const {
+		FileName = DEFAULT_CONFIG.fileName,
+		mytoken = DEFAULT_CONFIG.token,
+		subConverterDisplay = `https://${DEFAULT_SUB_CONVERTER}`,
+		subConfig = DEFAULT_SUB_CONFIG,
+		subRetry = DEFAULT_CONFIG.subRetry,
+		subTimeout = DEFAULT_CONFIG.subTimeout,
+		subApiTimeout = DEFAULT_CONFIG.subApiTimeout,
+		subCache = DEFAULT_CONFIG.subCache,
+		showFailedSub = DEFAULT_CONFIG.showFailedSub,
+	} = config;
 	const url = new URL(request.url);
 	try {
 		// POST请求处理
@@ -673,6 +702,7 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 				content = '读取数据时发生错误: ' + error.message;
 			}
 		}
+		const stats = summarizeLinks(content);
 
 		const html = `
 			<!DOCTYPE html>
@@ -790,10 +820,14 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 					---------------------------------------------------------------<br>
 					SUBAPI（订阅转换后端）: <strong>${subConverterDisplay}</strong><br>
 					SUBCONFIG（订阅转换配置文件）: <strong>${subConfig}</strong><br>
+					SUBRETRY: <strong>${subRetry}</strong> / SUBTIMEOUT: <strong>${subTimeout}ms</strong><br>
+					SUBAPITIMEOUT: <strong>${subApiTimeout}ms</strong> / SUBCACHE: <strong>${subCache}s</strong><br>
+					SHOW_FAILED_SUB: <strong>${showFailedSub ? '1' : '0'}</strong><br>
 					VERSION（部署标记）: <strong>${CUSTOM_FIX_VERSION}</strong><br>
 					---------------------------------------------------------------<br>
 					################################################################<br>
-					${FileName} 汇聚订阅编辑: 
+					${FileName} 汇聚订阅编辑:
+					<br>数据统计: <strong>${stats.total}</strong> 行 / 自建节点 <strong>${stats.local}</strong> / 远程订阅 <strong>${stats.remote}</strong><br>
 					<div class="editor-container">
 						${hasKV ? `
 						<textarea class="editor" 
