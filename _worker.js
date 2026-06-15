@@ -12,6 +12,7 @@ const DEFAULT_CONFIG = {
 	subRetry: 1, //订阅链接失败后的重试次数
 	subTimeout: 5000, //单个订阅链接请求超时时间，单位毫秒
 	subApiTimeout: 8000, //订阅转换后端请求超时时间，单位毫秒
+	subApiStagger: 250, //多个订阅转换后端的错峰并发间隔，单位毫秒
 	subCache: 300, //订阅结果缓存时间，单位秒
 	showFailedSub: false,
 	totalTB: 99,
@@ -25,8 +26,12 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-06-12-refresh-stats";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-06-16-adaptive-subapi";
 const BYTES_PER_TB = 1099511627776;
+const SUB_CONVERTER_STRATEGY = "adaptive-latency-aware";
+const SUB_CONVERTER_HEALTH_KEY = "__subapi_health_v1__";
+const SUB_CONVERTER_HEALTH_LIMIT = 24;
+const subConverterHealth = new Map();
 
 function normalizeSubConverter(rawValue) {
 	const value = String(rawValue || DEFAULT_SUB_CONVERTER).trim();
@@ -44,6 +49,164 @@ function normalizeSubConverters(rawValue) {
 		const converter = normalizeSubConverter(value);
 		return [`${converter.subProtocol}://${converter.subConverter}`, converter];
 	})).values()];
+}
+
+function getConverterKey(converter) {
+	return `${converter.subProtocol}://${converter.subConverter}`;
+}
+
+function getConverterHealth(converter) {
+	const key = getConverterKey(converter);
+	if (!subConverterHealth.has(key)) {
+		subConverterHealth.set(key, {
+			successCount: 0,
+			failureCount: 0,
+			totalLatency: 0,
+			lastLatency: 0,
+			lastUsedAt: 0,
+			lastSuccessAt: 0,
+			lastFailureAt: 0,
+			consecutiveFailures: 0,
+			updatedAt: 0,
+		});
+	}
+	return subConverterHealth.get(key);
+}
+
+function getAverageLatency(stats) {
+	return stats.successCount > 0 ? stats.totalLatency / stats.successCount : Number.POSITIVE_INFINITY;
+}
+
+function getConverterTier(stats) {
+	if (stats.successCount > 0 && stats.consecutiveFailures === 0) return 0;
+	if (stats.successCount === 0 && stats.failureCount === 0) return 1;
+	return 2;
+}
+
+function compareNumbers(a, b) {
+	return (a || 0) - (b || 0);
+}
+
+function prioritizeSubConverters(converters) {
+	const orderMap = new Map(converters.map((converter, index) => [getConverterKey(converter), index]));
+	return [...converters].sort((left, right) => {
+		const leftStats = getConverterHealth(left);
+		const rightStats = getConverterHealth(right);
+		const leftOrder = orderMap.get(getConverterKey(left)) ?? 0;
+		const rightOrder = orderMap.get(getConverterKey(right)) ?? 0;
+		const tierDiff = getConverterTier(leftStats) - getConverterTier(rightStats);
+		if (tierDiff !== 0) return tierDiff;
+
+		if (getConverterTier(leftStats) === 0) {
+			const leftAverage = getAverageLatency(leftStats);
+			const rightAverage = getAverageLatency(rightStats);
+			const latencyGap = Math.abs(leftAverage - rightAverage);
+			if (latencyGap > 300) return leftAverage - rightAverage;
+			const usageDiff = compareNumbers(leftStats.lastUsedAt, rightStats.lastUsedAt);
+			if (usageDiff !== 0) return usageDiff;
+			return leftAverage - rightAverage;
+		}
+
+		if (getConverterTier(leftStats) === 1) {
+			const usageDiff = compareNumbers(leftStats.lastUsedAt, rightStats.lastUsedAt);
+			if (usageDiff !== 0) return usageDiff;
+			return leftOrder - rightOrder;
+		}
+
+		const failureDiff = leftStats.consecutiveFailures - rightStats.consecutiveFailures;
+		if (failureDiff !== 0) return failureDiff;
+		const retryDiff = compareNumbers(leftStats.lastFailureAt, rightStats.lastFailureAt);
+		if (retryDiff !== 0) return retryDiff;
+		const totalFailureDiff = leftStats.failureCount - rightStats.failureCount;
+		if (totalFailureDiff !== 0) return totalFailureDiff;
+		return leftOrder - rightOrder;
+	});
+}
+
+function recordSubConverterResult(converter, isSuccess, latencyMs) {
+	const stats = getConverterHealth(converter);
+	const now = Date.now();
+	stats.lastUsedAt = now;
+	stats.updatedAt = now;
+	if (Number.isFinite(latencyMs) && latencyMs >= 0) stats.lastLatency = latencyMs;
+
+	if (isSuccess) {
+		stats.successCount += 1;
+		stats.consecutiveFailures = 0;
+		stats.lastSuccessAt = now;
+		if (Number.isFinite(latencyMs) && latencyMs >= 0) stats.totalLatency += latencyMs;
+		return;
+	}
+
+	stats.failureCount += 1;
+	stats.consecutiveFailures += 1;
+	stats.lastFailureAt = now;
+}
+
+function sleep(ms) {
+	return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function normalizeStoredConverterStats(stats = {}) {
+	return {
+		successCount: Number(stats.successCount) || 0,
+		failureCount: Number(stats.failureCount) || 0,
+		totalLatency: Number(stats.totalLatency) || 0,
+		lastLatency: Number(stats.lastLatency) || 0,
+		lastUsedAt: Number(stats.lastUsedAt) || 0,
+		lastSuccessAt: Number(stats.lastSuccessAt) || 0,
+		lastFailureAt: Number(stats.lastFailureAt) || 0,
+		consecutiveFailures: Number(stats.consecutiveFailures) || 0,
+		updatedAt: Number(stats.updatedAt) || 0,
+	};
+}
+
+async function loadPersistedSubConverterHealth(kv, converters, DEBUG = false) {
+	if (!kv) return;
+	try {
+		const raw = await kv.get(SUB_CONVERTER_HEALTH_KEY);
+		if (!raw) return;
+		const parsed = JSON.parse(raw);
+		const entries = parsed?.entries && typeof parsed.entries === 'object' ? parsed.entries : {};
+		for (const converter of converters) {
+			const key = getConverterKey(converter);
+			if (!entries[key]) continue;
+			const currentStats = getConverterHealth(converter);
+			const storedStats = normalizeStoredConverterStats(entries[key]);
+			if (storedStats.updatedAt >= (currentStats.updatedAt || 0)) {
+				subConverterHealth.set(key, storedStats);
+			}
+		}
+		debugLog(DEBUG, `已加载订阅转换后端健康度: ${Object.keys(entries).length}`);
+	} catch (error) {
+		debugLog(DEBUG, '加载订阅转换后端健康度失败', error);
+	}
+}
+
+function serializeSubConverterHealth(converters) {
+	const candidateKeys = converters?.length
+		? [...new Set(converters.map(converter => getConverterKey(converter)))]
+		: [...subConverterHealth.keys()];
+	const entries = candidateKeys
+		.map(key => [key, normalizeStoredConverterStats(subConverterHealth.get(key))])
+		.filter(([, stats]) => stats.successCount > 0 || stats.failureCount > 0)
+		.sort((left, right) => (right[1].updatedAt || 0) - (left[1].updatedAt || 0))
+		.slice(0, SUB_CONVERTER_HEALTH_LIMIT);
+	return Object.fromEntries(entries);
+}
+
+async function persistSubConverterHealth(kv, converters, DEBUG = false) {
+	if (!kv) return;
+	try {
+		const entries = serializeSubConverterHealth(converters);
+		await kv.put(SUB_CONVERTER_HEALTH_KEY, JSON.stringify({
+			updatedAt: Date.now(),
+			entries,
+		}));
+		debugLog(DEBUG, `已持久化订阅转换后端健康度: ${Object.keys(entries).length}`);
+	} catch (error) {
+		debugLog(DEBUG, '持久化订阅转换后端健康度失败', error);
+	}
 }
 
 function isDebugEnabled(env) {
@@ -119,11 +282,13 @@ export default {
 		const TG = Number(env.TG ?? DEFAULT_CONFIG.tg);
 		const subConverters = normalizeSubConverters(env.SUBAPI || DEFAULT_SUB_CONVERTER);
 		const subConverterDisplay = subConverters.map(item => `${item.subProtocol}://${item.subConverter}`).join(', ');
+		const subConverterStateBackend = env.KV ? 'KV' : 'MEMORY';
 		const subConfig = env.SUBCONFIG || DEFAULT_SUB_CONFIG;
 		const FileName = env.SUBNAME || DEFAULT_CONFIG.fileName;
 		const subRetry = normalizeNumber(env.SUBRETRY, DEFAULT_CONFIG.subRetry, 0, 5);
 		const subTimeout = normalizeNumber(env.SUBTIMEOUT, DEFAULT_CONFIG.subTimeout, 1000, 30000);
 		const subApiTimeout = normalizeNumber(env.SUBAPITIMEOUT, DEFAULT_CONFIG.subApiTimeout, 1000, 30000);
+		const subApiStagger = normalizeNumber(env.SUBAPISTAGGER, DEFAULT_CONFIG.subApiStagger, 0, 3000);
 		const subCache = normalizeNumber(env.SUBCACHE, DEFAULT_CONFIG.subCache, 0, 3600);
 		const showFailedSub = normalizeBoolean(env.SHOW_FAILED_SUB, DEFAULT_CONFIG.showFailedSub);
 		const refreshCache = url.searchParams.has('refresh');
@@ -158,13 +323,14 @@ export default {
 				}),
 			});
 		} else {
+			if (subConverters.length > 0) await loadPersistedSubConverterHealth(env.KV, subConverters, DEBUG);
 			let MainData = DEFAULT_MAIN_DATA;
 			let urls = [];
 			if (env.KV) {
 				await 迁移地址列表(env, 'LINK.txt');
 				if (userAgent.includes('mozilla') && !url.search) {
 					runInBackground(ctx, sendMessage(`#编辑订阅 ${FileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgentHeader}</tg-spoiler>\n域名: ${url.hostname}\n<tg-spoiler>入口: ${url.pathname + url.search}</tg-spoiler>`, { BotToken, ChatID }), DEBUG);
-					return await KV(request, env, 'LINK.txt', 访客订阅, { FileName, mytoken, subConverterDisplay, subConfig, subRetry, subTimeout, subApiTimeout, subCache, showFailedSub });
+					return await KV(request, env, 'LINK.txt', 访客订阅, { FileName, mytoken, subConverterDisplay, subConverterStateBackend, subConfig, subRetry, subTimeout, subApiTimeout, subApiStagger, subCache, showFailedSub });
 				} else {
 					MainData = await env.KV.get('LINK.txt') || DEFAULT_MAIN_DATA;
 				}
@@ -232,6 +398,7 @@ export default {
 			if (cachedResponse) return cachedResponse;
 
 			const 订阅链接数组 = [...new Set(urls)].filter(item => item?.trim?.()); // 去重
+			let selectedSubConverter = '';
 			if (订阅链接数组.length > 0) {
 				const 请求订阅响应内容 = await getSUB(订阅链接数组, 追加UA, userAgentHeader, { DEBUG, subRetry, subTimeout, showFailedSub });
 				debugLog(DEBUG, 请求订阅响应内容);
@@ -239,7 +406,8 @@ export default {
 				订阅转换URL += "|" + 请求订阅响应内容[1];
 				if (订阅格式 == 'base64' && !isSubConverterRequest && 请求订阅响应内容[1].includes('://')) {
 					try {
-						const subConverterContent = await fetchSubConverterText(subConverters, converter => buildSubConverterUrl(converter, 'mixed', 请求订阅响应内容[1], subConfig), { 'User-Agent': 'v2rayN/CF-Workers-SUB  (https://github.com/cmliu/CF-Workers-SUB)' }, { DEBUG, subApiTimeout });
+						const { text: subConverterContent, converter: mixedSubConverter } = await fetchSubConverterText(subConverters, converter => buildSubConverterUrl(converter, 'mixed', 请求订阅响应内容[1], subConfig), { 'User-Agent': 'v2rayN/CF-Workers-SUB  (https://github.com/cmliu/CF-Workers-SUB)' }, { DEBUG, subApiTimeout, subApiStagger, kv: env.KV, ctx });
+						if (mixedSubConverter) selectedSubConverter = mixedSubConverter;
 						req_data += '\n' + atob(subConverterContent);
 					} catch (error) {
 						debugLog(DEBUG, '订阅转换请回base64失败，检查订阅转换后端是否正常运行', error);
@@ -294,6 +462,9 @@ export default {
 				"Profile-web-page-url": request.url.includes('?') ? request.url.split('?')[0] : request.url,
 				//"Subscription-Userinfo": `upload=${UD}; download=${UD}; total=${total}; expire=${expire}`,
 			};
+			if (selectedSubConverter) responseHeaders["X-Sub-Converter"] = selectedSubConverter;
+			responseHeaders["X-Sub-Converter-Strategy"] = SUB_CONVERTER_STRATEGY;
+			responseHeaders["X-Sub-Converter-State"] = subConverterStateBackend;
 
 			if (订阅格式 == 'base64' || token == fakeToken) {
 				const response = new Response(base64Data, { headers: runtimeHeaders(responseHeaders) });
@@ -311,7 +482,10 @@ export default {
 			}
 			//console.log(订阅转换URL);
 			try {
-				let subConverterContent = await fetchSubConverterText(subConverters, subConverterUrl, { 'User-Agent': userAgentHeader }, { DEBUG, subApiTimeout });//订阅转换
+				const converterResult = await fetchSubConverterText(subConverters, subConverterUrl, { 'User-Agent': userAgentHeader }, { DEBUG, subApiTimeout, subApiStagger, kv: env.KV, ctx });//订阅转换
+				selectedSubConverter = converterResult.converter || selectedSubConverter;
+				responseHeaders["X-Sub-Converter"] = selectedSubConverter;
+				let subConverterContent = converterResult.text;
 				if (订阅格式 == 'clash') subConverterContent = await clashFix(subConverterContent);
 				// 只有非浏览器订阅才会返回SUBNAME
 				const headers = runtimeHeaders(responseHeaders);
@@ -459,26 +633,59 @@ function buildSubConverterUrl(converter, target, sourceUrl, subConfig, extraQuer
 	return `${converter.subProtocol}://${converter.subConverter}/sub?target=${target}${extra}&url=${encodeURIComponent(sourceUrl)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false&new_name=true`;
 }
 
-async function fetchSubConverterText(converters, buildUrl, headers, options = {}) {
+async function requestSubConverter(converter, buildUrl, headers, options = {}) {
 	const { DEBUG = false, subApiTimeout = DEFAULT_CONFIG.subApiTimeout } = options;
-	let lastError;
-	for (const converter of converters) {
-		const converterUrl = buildUrl(converter);
-		const controller = new AbortController();
-		const timeout = setTimeout(() => controller.abort(), subApiTimeout);
-		try {
-			const response = await fetch(converterUrl, { headers, signal: controller.signal });
-			if (!response.ok) throw new Error(`HTTP ${response.status}`);
-			debugLog(DEBUG, `订阅转换成功: ${converter.subProtocol}://${converter.subConverter}`);
-			return await response.text();
-		} catch (error) {
-			lastError = error;
-			debugLog(DEBUG, `订阅转换失败: ${converterUrl}`, error);
-		} finally {
-			clearTimeout(timeout);
-		}
+	const converterUrl = buildUrl(converter);
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), subApiTimeout);
+	const startedAt = Date.now();
+	try {
+		const response = await fetch(converterUrl, { headers, signal: controller.signal });
+		if (!response.ok) throw new Error(`HTTP ${response.status}`);
+		const latencyMs = Date.now() - startedAt;
+		recordSubConverterResult(converter, true, latencyMs);
+		debugLog(DEBUG, `订阅转换成功: ${converter.subProtocol}://${converter.subConverter} ${latencyMs}ms`);
+		return { text: await response.text(), converter: getConverterKey(converter), latencyMs };
+	} catch (error) {
+		recordSubConverterResult(converter, false, Date.now() - startedAt);
+		debugLog(DEBUG, `订阅转换失败: ${converterUrl}`, error);
+		throw error;
+	} finally {
+		clearTimeout(timeout);
 	}
-	throw lastError || new Error('所有订阅转换后端均不可用');
+}
+
+async function fetchSubConverterText(converters, buildUrl, headers, options = {}) {
+	const { DEBUG = false, subApiTimeout = DEFAULT_CONFIG.subApiTimeout, subApiStagger = DEFAULT_CONFIG.subApiStagger, kv = null, ctx = null } = options;
+	const prioritizedConverters = prioritizeSubConverters(converters);
+	if (prioritizedConverters.length === 0) throw new Error('未配置订阅转换后端');
+
+	try {
+		if (prioritizedConverters.length === 1 || subApiStagger === 0) {
+			let lastError;
+			for (const converter of prioritizedConverters) {
+				try {
+					return await requestSubConverter(converter, buildUrl, headers, { DEBUG, subApiTimeout });
+				} catch (error) {
+					lastError = error;
+				}
+			}
+			throw lastError || new Error('所有订阅转换后端均不可用');
+		}
+
+		const delayedRequests = prioritizedConverters.map((converter, index) => (async () => {
+			const delayMs = index * subApiStagger;
+			if (delayMs > 0) await sleep(delayMs);
+			return requestSubConverter(converter, buildUrl, headers, { DEBUG, subApiTimeout });
+		})());
+
+		return await Promise.any(delayedRequests);
+	} catch (error) {
+		const lastError = error?.errors?.[error.errors.length - 1];
+		throw lastError || error || new Error('所有订阅转换后端均不可用');
+	} finally {
+		runInBackground(ctx, persistSubConverterHealth(kv, prioritizedConverters, DEBUG), DEBUG);
+	}
 }
 
 async function proxyURL(proxyURL, url, DEBUG = false) {
@@ -668,10 +875,12 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 		FileName = DEFAULT_CONFIG.fileName,
 		mytoken = DEFAULT_CONFIG.token,
 		subConverterDisplay = `https://${DEFAULT_SUB_CONVERTER}`,
+		subConverterStateBackend = 'MEMORY',
 		subConfig = DEFAULT_SUB_CONFIG,
 		subRetry = DEFAULT_CONFIG.subRetry,
 		subTimeout = DEFAULT_CONFIG.subTimeout,
 		subApiTimeout = DEFAULT_CONFIG.subApiTimeout,
+		subApiStagger = DEFAULT_CONFIG.subApiStagger,
 		subCache = DEFAULT_CONFIG.subCache,
 		showFailedSub = DEFAULT_CONFIG.showFailedSub,
 	} = config;
@@ -819,10 +1028,14 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 					订阅转换配置<br>
 					---------------------------------------------------------------<br>
 					SUBAPI（订阅转换后端）: <strong>${subConverterDisplay}</strong><br>
+					SUBAPI STRATEGY: <strong>${SUB_CONVERTER_STRATEGY}</strong><br>
+					SUBAPI STATE: <strong>${subConverterStateBackend}</strong><br>
 					SUBCONFIG（订阅转换配置文件）: <strong>${subConfig}</strong><br>
 					SUBRETRY: <strong>${subRetry}</strong> / SUBTIMEOUT: <strong>${subTimeout}ms</strong><br>
-					SUBAPITIMEOUT: <strong>${subApiTimeout}ms</strong> / SUBCACHE: <strong>${subCache}s</strong><br>
+					SUBAPITIMEOUT: <strong>${subApiTimeout}ms</strong> / SUBAPISTAGGER: <strong>${subApiStagger}ms</strong><br>
+					SUBCACHE: <strong>${subCache}s</strong><br>
 					SHOW_FAILED_SUB: <strong>${showFailedSub ? '1' : '0'}</strong><br>
+					Modified by <strong>FisheeHei</strong><br>
 					VERSION（部署标记）: <strong>${CUSTOM_FIX_VERSION}</strong><br>
 					---------------------------------------------------------------<br>
 					################################################################<br>
