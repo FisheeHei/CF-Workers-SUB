@@ -368,7 +368,8 @@ export default {
 			}
 
 			let subConverterUrl;
-			let 订阅转换URL = `${url.origin}/${await MD5MD5(fakeToken)}?token=${fakeToken}`;
+			const 订阅转换基础URL = `${url.origin}/${await MD5MD5(fakeToken)}?token=${fakeToken}`;
+			let 订阅转换URL = 订阅转换基础URL;
 			//console.log(订阅转换URL);
 			let req_data = MainData;
 
@@ -379,23 +380,6 @@ export default {
 			else if (url.searchParams.has('surge')) 追加UA = 'surge';
 			else if (url.searchParams.has('quanx')) 追加UA = 'Quantumult%20X';
 			else if (url.searchParams.has('loon')) 追加UA = 'Loon';
-
-			const cacheUrl = new URL(request.url);
-			cacheUrl.searchParams.delete('refresh');
-			const cacheSeed = [
-				cacheUrl.toString(),
-				订阅格式,
-				MainData,
-				urls.join('\n'),
-				env.WARP || '',
-				subConverterDisplay,
-				subConfig,
-			].join('\n---\n');
-			const cacheKey = request.method === "GET" && subCache > 0
-				? new Request(`${url.origin}/__sub-cache/${await MD5MD5(cacheSeed)}`, { method: "GET" })
-				: null;
-			const cachedResponse = refreshCache ? null : await getSubscriptionCache(cacheKey, DEBUG);
-			if (cachedResponse) return cachedResponse;
 
 			const 订阅链接数组 = [...new Set(urls)].filter(item => item?.trim?.()); // 去重
 			let selectedSubConverter = '';
@@ -416,6 +400,30 @@ export default {
 			}
 
 			if (env.WARP) 订阅转换URL += "|" + (await ADD(env.WARP)).join("|");
+			const sourceFingerprint = await MD5MD5([
+				req_data,
+				订阅转换URL,
+				订阅格式,
+				subConverterDisplay,
+				subConfig,
+			].join('\n---\n'));
+			订阅转换URL = `${订阅转换基础URL}&src=${sourceFingerprint}` + 订阅转换URL.slice(订阅转换基础URL.length);
+
+			const cacheUrl = new URL(request.url);
+			cacheUrl.searchParams.delete('refresh');
+			const cacheSeed = [
+				cacheUrl.toString(),
+				订阅格式,
+				sourceFingerprint,
+				env.WARP || '',
+				subConverterDisplay,
+				subConfig,
+			].join('\n---\n');
+			const cacheKey = request.method === "GET" && subCache > 0
+				? new Request(`${url.origin}/__sub-cache/${await MD5MD5(cacheSeed)}`, { method: "GET" })
+				: null;
+			const cachedResponse = refreshCache ? null : await getSubscriptionCache(cacheKey, DEBUG);
+			if (cachedResponse) return cachedResponse;
 			//修复中文错误
 			const utf8Encoder = new TextEncoder();
 			const encodedData = utf8Encoder.encode(req_data);
@@ -462,6 +470,7 @@ export default {
 				"Profile-web-page-url": request.url.includes('?') ? request.url.split('?')[0] : request.url,
 				//"Subscription-Userinfo": `upload=${UD}; download=${UD}; total=${total}; expire=${expire}`,
 			};
+			responseHeaders["X-Sub-Source-Fingerprint"] = sourceFingerprint;
 			if (selectedSubConverter) responseHeaders["X-Sub-Converter"] = selectedSubConverter;
 			responseHeaders["X-Sub-Converter-Strategy"] = SUB_CONVERTER_STRATEGY;
 			responseHeaders["X-Sub-Converter-State"] = subConverterStateBackend;
@@ -1035,7 +1044,6 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 					SUBAPITIMEOUT: <strong>${subApiTimeout}ms</strong> / SUBAPISTAGGER: <strong>${subApiStagger}ms</strong><br>
 					SUBCACHE: <strong>${subCache}s</strong><br>
 					SHOW_FAILED_SUB: <strong>${showFailedSub ? '1' : '0'}</strong><br>
-					Modified by <strong>FisheeHei</strong><br>
 					VERSION（部署标记）: <strong>${CUSTOM_FIX_VERSION}</strong><br>
 					---------------------------------------------------------------<br>
 					################################################################<br>
@@ -1055,6 +1063,10 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 					<br>
 					################################################################<br>
 					${decodeURIComponent(atob('dGVsZWdyYW0lMjAlRTQlQkElQTQlRTYlQjUlODElRTclQkUlQTQlMjAlRTYlOEElODAlRTYlOUMlQUYlRTUlQTQlQTclRTQlQkQlQUMlN0UlRTUlOUMlQTglRTclQkElQkYlRTUlOEYlOTElRTclODklOEMhJTNDYnIlM0UKJTNDYSUyMGhyZWYlM0QlMjdodHRwcyUzQSUyRiUyRnQubWUlMkZDTUxpdXNzc3MlMjclM0VodHRwcyUzQSUyRiUyRnQubWUlMkZDTUxpdXNzc3MlM0MlMkZhJTNFJTNDYnIlM0UKLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tJTNDYnIlM0UKZ2l0aHViJTIwJUU5JUExJUI5JUU3JTlCJUFFJUU1JTlDJUIwJUU1JTlEJTgwJTIwU3RhciFTdGFyIVN0YXIhISElM0NiciUzRQolM0NhJTIwaHJlZiUzRCUyN2h0dHBzJTNBJTJGJTJGZ2l0aHViLmNvbSUyRmNtbGl1JTJGQ0YtV29ya2Vycy1TVUIlMjclM0VodHRwcyUzQSUyRiUyRmdpdGh1Yi5jb20lMkZjbWxpdSUyRkNGLVdvcmtlcnMtU1VCJTNDJTJGYSUzRSUzQ2JyJTNFCi0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLSUzQ2JyJTNFCiUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMw=='))}
+					Modified by <strong>FisheeHei</strong><br>
+					custom-fix repo: <a href="https://github.com/FisheeHei/CF-Workers-SUB" target="_blank" rel="noopener noreferrer">https://github.com/FisheeHei/CF-Workers-SUB</a><br>
+					----------------------------------------------------------------<br>
+					################################################################<br>
 					<br><br>UA: <strong>${request.headers.get('User-Agent')}</strong>
 					<script>
 					function copyToClipboard(text, qrcode) {
