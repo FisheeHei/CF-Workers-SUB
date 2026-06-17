@@ -1,5 +1,12 @@
 # 更新日志
 
+## custom-fix-preview - 2026-06-18
+
+- KV 订阅结果持久化缓存：冷启动后无需重新抓取全量订阅链接，降低对 SUBAPI 转换后端的压力。
+- 网页界面隐藏非关键订阅转换配置（仅保留 SUBAPI / SUBCONFIG / VERSION 可见）。
+- wrangler.toml 启用 KV 命名空间绑定。
+- 版本标记更新为 custom-fix-2026-06-18-kv-sub-cache。
+
 ## custom-fix - 2026-06-17
 
 - 修复远程订阅 URL 不变但上游优选结果变化时，最终订阅缓存可能继续复用旧节点的问题。
