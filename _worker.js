@@ -26,7 +26,7 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-06-16-adaptive-subapi";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-06-18-kv-sub-cache";
 const BYTES_PER_TB = 1099511627776;
 const SUB_CONVERTER_STRATEGY = "adaptive-latency-aware";
 const SUB_CONVERTER_HEALTH_KEY = "__subapi_health_v1__";
@@ -269,6 +269,29 @@ function storeSubscriptionCache(cacheKey, response, subCache, ctx, DEBUG = false
 	});
 }
 
+
+// KV 持久化缓存：订阅结果写入 KV，冷启动后无需重新抓取全量订阅链接
+const SUB_KV_PREFIX = "__sub:";
+
+async function getSubFromKV(kv, cacheSeed) {
+	if (!kv) return null;
+	try {
+		const key = SUB_KV_PREFIX + await MD5MD5(cacheSeed);
+		const cached = await kv.get(key);
+		if (cached) return cached;
+	} catch (e) { /* KV 读取失败静默降级 */ }
+	return null;
+}
+
+function putSubToKV(kv, cacheSeed, data, ttl, ctx) {
+	if (!kv || !ttl) return;
+	runInBackground(ctx, (async () => {
+		try {
+			const key = SUB_KV_PREFIX + await MD5MD5(cacheSeed);
+			await kv.put(key, data, { expirationTtl: Math.max(ttl, 60) });
+		} catch (e) { /* KV 写入失败静默降级 */ }
+	})(), false);
+}
 export default {
 	async fetch(request, env, ctx) {
 		const userAgentHeader = request.headers.get('User-Agent');
@@ -423,6 +446,11 @@ export default {
 				? new Request(`${url.origin}/__sub-cache/${await MD5MD5(cacheSeed)}`, { method: "GET" })
 				: null;
 			const cachedResponse = refreshCache ? null : await getSubscriptionCache(cacheKey, DEBUG);
+			// KV 缓存回退：memory 未命中时尝试 KV（避免冷启动后重复抓取订阅）
+			let kvCachedBase64 = null;
+			if (!cachedResponse && env.KV) {
+				kvCachedBase64 = await getSubFromKV(env.KV, cacheSeed);
+			}
 			if (cachedResponse) return cachedResponse;
 			//修复中文错误
 			const utf8Encoder = new TextEncoder();
@@ -435,8 +463,8 @@ export default {
 			const uniqueLines = new Set(text.split('\n'));
 			const result = [...uniqueLines].join('\n');
 			//console.log(result);
-
-			let base64Data;
+			let base64Data = kvCachedBase64 || null;
+			if (!base64Data) {
 			try {
 				base64Data = btoa(result);
 			} catch (e) {
@@ -462,6 +490,10 @@ export default {
 
 				base64Data = encodeBase64(result)
 			}
+			} // end if (!base64Data)
+
+			// 写入 KV 持久化缓存（异步，不阻塞响应）
+			putSubToKV(env.KV, cacheSeed, base64Data, subCache, ctx);
 
 			// 构建响应头对象
 			const responseHeaders = {
@@ -1037,13 +1069,13 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 					订阅转换配置<br>
 					---------------------------------------------------------------<br>
 					SUBAPI（订阅转换后端）: <strong>${subConverterDisplay}</strong><br>
-					SUBAPI STRATEGY: <strong>${SUB_CONVERTER_STRATEGY}</strong><br>
-					SUBAPI STATE: <strong>${subConverterStateBackend}</strong><br>
+					<!-- SUBAPI STRATEGY: <strong>${SUB_CONVERTER_STRATEGY}</strong><br> -->
+					<!-- SUBAPI STATE: <strong>${subConverterStateBackend}</strong><br> -->
 					SUBCONFIG（订阅转换配置文件）: <strong>${subConfig}</strong><br>
-					SUBRETRY: <strong>${subRetry}</strong> / SUBTIMEOUT: <strong>${subTimeout}ms</strong><br>
-					SUBAPITIMEOUT: <strong>${subApiTimeout}ms</strong> / SUBAPISTAGGER: <strong>${subApiStagger}ms</strong><br>
-					SUBCACHE: <strong>${subCache}s</strong><br>
-					SHOW_FAILED_SUB: <strong>${showFailedSub ? '1' : '0'}</strong><br>
+					<!-- SUBRETRY: <strong>${subRetry}</strong> / SUBTIMEOUT: <strong>${subTimeout}ms</strong><br> -->
+					<!-- SUBAPITIMEOUT: <strong>${subApiTimeout}ms</strong> / SUBAPISTAGGER: <strong>${subApiStagger}ms</strong><br> -->
+					<!-- SUBCACHE: <strong>${subCache}s</strong><br> -->
+					<!-- SHOW_FAILED_SUB: <strong>${showFailedSub ? '1' : '0'}</strong><br> -->
 					VERSION（部署标记）: <strong>${CUSTOM_FIX_VERSION}</strong><br>
 					---------------------------------------------------------------<br>
 					################################################################<br>
@@ -1063,7 +1095,7 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 					<br>
 					################################################################<br>
 					${decodeURIComponent(atob('dGVsZWdyYW0lMjAlRTQlQkElQTQlRTYlQjUlODElRTclQkUlQTQlMjAlRTYlOEElODAlRTYlOUMlQUYlRTUlQTQlQTclRTQlQkQlQUMlN0UlRTUlOUMlQTglRTclQkElQkYlRTUlOEYlOTElRTclODklOEMhJTNDYnIlM0UKJTNDYSUyMGhyZWYlM0QlMjdodHRwcyUzQSUyRiUyRnQubWUlMkZDTUxpdXNzc3MlMjclM0VodHRwcyUzQSUyRiUyRnQubWUlMkZDTUxpdXNzc3MlM0MlMkZhJTNFJTNDYnIlM0UKLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tJTNDYnIlM0UKZ2l0aHViJTIwJUU5JUExJUI5JUU3JTlCJUFFJUU1JTlDJUIwJUU1JTlEJTgwJTIwU3RhciFTdGFyIVN0YXIhISElM0NiciUzRQolM0NhJTIwaHJlZiUzRCUyN2h0dHBzJTNBJTJGJTJGZ2l0aHViLmNvbSUyRmNtbGl1JTJGQ0YtV29ya2Vycy1TVUIlMjclM0VodHRwcyUzQSUyRiUyRmdpdGh1Yi5jb20lMkZjbWxpdSUyRkNGLVdvcmtlcnMtU1VCJTNDJTJGYSUzRSUzQ2JyJTNFCi0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLSUzQ2JyJTNFCiUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMw=='))}
-					Modified by <strong>FisheeHei</strong><br>
+					<br>Modified by <strong>FisheeHei</strong><br>
 					custom-fix repo: <a href="https://github.com/FisheeHei/CF-Workers-SUB" target="_blank" rel="noopener noreferrer">https://github.com/FisheeHei/CF-Workers-SUB</a><br>
 					----------------------------------------------------------------<br>
 					################################################################<br>
