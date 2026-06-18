@@ -26,7 +26,7 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-06-18-robust-sub-decode";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-06-18-sub-fetch-diag";
 const BYTES_PER_TB = 1099511627776;
 const SUB_CONVERTER_STRATEGY = "adaptive-latency-aware";
 const SUB_CONVERTER_HEALTH_KEY = "__subapi_health_v1__";
@@ -406,9 +406,11 @@ export default {
 
 			const 订阅链接数组 = [...new Set(urls)].filter(item => item?.trim?.()); // 去重
 			let selectedSubConverter = '';
+			let subStatus = [];
 			if (订阅链接数组.length > 0) {
 				const 请求订阅响应内容 = await getSUB(订阅链接数组, 追加UA, userAgentHeader, { DEBUG, subRetry, subTimeout, showFailedSub });
 				debugLog(DEBUG, 请求订阅响应内容);
+				subStatus = 请求订阅响应内容[2] || [];
 				req_data += 请求订阅响应内容[0].join('\n');
 				订阅转换URL += "|" + 请求订阅响应内容[1];
 				if (订阅格式 == 'base64' && !isSubConverterRequest && 请求订阅响应内容[1].includes('://')) {
@@ -505,6 +507,7 @@ export default {
 			responseHeaders["X-Sub-Source-Fingerprint"] = sourceFingerprint;
 			if (selectedSubConverter) responseHeaders["X-Sub-Converter"] = selectedSubConverter;
 			responseHeaders["X-Sub-Converter-Strategy"] = SUB_CONVERTER_STRATEGY;
+			if (subStatus && subStatus.length) responseHeaders["X-Sub-Fetch-Status"] = subStatus.join("; ");
 			responseHeaders["X-Sub-Converter-State"] = subConverterStateBackend;
 
 			if (订阅格式 == 'base64' || token == fakeToken) {
@@ -794,6 +797,7 @@ async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
 	let newapi = "";
 	let 订阅转换URLs = "";
 	let 异常订阅 = "";
+	let subStatus = [];
 
 	try {
 		// 使用Promise.allSettled等待所有API请求完成，无论成功或失败
@@ -805,12 +809,14 @@ async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
 			if (response.status === 'rejected') {
 				const reason = response.reason;
 				if (reason && reason.name === 'AbortError') {
+					subStatus.push(api[index] + " TIMEOUT");
 					return {
 						status: '超时',
 						value: null,
 						apiUrl: api[index] // 将原始的apiUrl添加到返回对象中
 					};
 				}
+				subStatus.push(api[index] + " FAIL " + (reason.status || reason.name || "unknown"));
 				debugLog(DEBUG, `请求失败: ${api[index]}, 错误信息: ${reason.status} ${reason.statusText}`);
 				return {
 					status: '请求失败',
@@ -830,6 +836,7 @@ async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
 		for (const response of modifiedResponses) {
 			// 检查响应状态是否为'fulfilled'
 			if (response.status === 'fulfilled') {
+				subStatus.push(response.apiUrl + " OK");
 				const content = await response.value || 'null'; // 获取响应的内容
 				if (content.includes('proxies:')) {
 					//console.log('Clash订阅: ' + response.apiUrl);
@@ -870,7 +877,7 @@ async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
 
 	const 订阅内容 = await ADD(newapi + 异常订阅); // 将处理后的内容转换为数组
 	// 返回处理后的结果
-	return [订阅内容, 订阅转换URLs];
+	return [订阅内容, 订阅转换URLs, subStatus];
 }
 
 async function fetchSubscription(targetUrl, 追加UA, userAgentHeader, options = {}) {
