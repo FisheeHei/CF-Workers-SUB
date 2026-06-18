@@ -26,7 +26,7 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-06-18-kv-sub-cache";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-06-18-robust-sub-decode";
 const BYTES_PER_TB = 1099511627776;
 const SUB_CONVERTER_STRATEGY = "adaptive-latency-aware";
 const SUB_CONVERTER_HEALTH_KEY = "__subapi_health_v1__";
