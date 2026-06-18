@@ -26,7 +26,7 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-06-18-link-aware-cache-fix";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-06-18-subapi-fallback";
 const BYTES_PER_TB = 1099511627776;
 const SUB_CONVERTER_STRATEGY = "adaptive-latency-aware";
 const SUB_CONVERTER_HEALTH_KEY = "__subapi_health_v1__";
@@ -411,7 +411,7 @@ export default {
 			let selectedSubConverter = '';
 			let subStatus = [];
 			if (订阅链接数组.length > 0) {
-				const 请求订阅响应内容 = await getSUB(订阅链接数组, 追加UA, userAgentHeader, { DEBUG, subRetry, subTimeout, showFailedSub });
+				const 请求订阅响应内容 = await getSUB(订阅链接数组, 追加UA, userAgentHeader, { DEBUG, subRetry, subTimeout, showFailedSub, subConverters });
 				debugLog(DEBUG, 请求订阅响应内容);
 				subStatus = 请求订阅响应内容[2] || [];
 				req_data += 请求订阅响应内容[0].join('\n');
@@ -795,7 +795,7 @@ async function proxyURL(proxyURL, url, DEBUG = false) {
 }
 
 async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
-	const { DEBUG = false, subRetry = DEFAULT_CONFIG.subRetry, subTimeout = DEFAULT_CONFIG.subTimeout, showFailedSub = DEFAULT_CONFIG.showFailedSub } = options;
+	const { DEBUG = false, subRetry = DEFAULT_CONFIG.subRetry, subTimeout = DEFAULT_CONFIG.subTimeout, showFailedSub = DEFAULT_CONFIG.showFailedSub, subConverters = null } = options;
 	if (!api || api.length === 0) {
 		return [];
 	} else api = [...new Set(api)]; // 去重
@@ -873,6 +873,34 @@ async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
 						if (showFailedSub) 异常订阅 += `${异常订阅LINK}\n`;
 						}
 					}
+				}
+			}
+		}
+		// SUBAPI代理公底: 直连失败的订阅改走 SUBAPI 代为抓取
+		if (subConverters && subConverters.length > 0) {
+			const failedUrls = modifiedResponses.filter(r => r.status !== 'fulfilled');
+			for (const failed of failedUrls) {
+				const converter = subConverters[0]; // 选第一个可用的 SUBAPI
+				const proxyUrl = `${converter.subProtocol}://${converter.subConverter}/sub?target=auto&url=${encodeURIComponent(failed.apiUrl)}&insert=false`;
+				try {
+					const controller = new AbortController();
+					const timer = setTimeout(() => controller.abort(), subTimeout);
+					const proxyResp = await fetch(proxyUrl, { headers: { 'User-Agent': userAgentHeader || `v2rayN/CF-Workers-SUB` }, signal: controller.signal });
+					clearTimeout(timer);
+					if (!proxyResp.ok) throw new Error(`SUBAPI HTTP ${proxyResp.status}`);
+					const proxyContent = await proxyResp.text();
+					const decoded = tryDecodeBase64(proxyContent);
+					if (decoded) {
+						newapi += decoded + '\n';
+						subStatus[subStatus.findIndex(s => s.startsWith(failed.apiUrl))] = failed.apiUrl + ' SUBAPI_OK';
+					} else if (/^[a-z]+:\/\//im.test(proxyContent)) {
+						newapi += proxyContent + '\n';
+						subStatus[subStatus.findIndex(s => s.startsWith(failed.apiUrl))] = failed.apiUrl + ' SUBAPI_OK';
+					} else {
+						subStatus[subStatus.findIndex(s => s.startsWith(failed.apiUrl))] = failed.apiUrl + ' SUBAPI_FAIL';
+					}
+				} catch (e) {
+					debugLog(DEBUG, `SUBAPI fallback failed for ${failed.apiUrl}:`, e.message || e);
 				}
 			}
 		}
