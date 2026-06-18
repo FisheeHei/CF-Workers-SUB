@@ -26,7 +26,7 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-06-18-subapi-fallback";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-06-18-circuit-breaker";
 const BYTES_PER_TB = 1099511627776;
 const SUB_CONVERTER_STRATEGY = "adaptive-latency-aware";
 const SUB_CONVERTER_HEALTH_KEY = "__subapi_health_v1__";
@@ -794,6 +794,11 @@ async function proxyURL(proxyURL, url, DEBUG = false) {
 	return newResponse;
 }
 
+// 熔断机制: 连续失败超过阈值的订阅链接暂时跳过
+const circuitBreaker = new Map(); // key: url, value: {failures, cooldownUntil}
+const CIRCUIT_COOLDOWN_MS = 300000; // 5分钟冷却期
+const FETCH_CONCURRENCY = 6; // 每批并发数
+
 async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
 	const { DEBUG = false, subRetry = DEFAULT_CONFIG.subRetry, subTimeout = DEFAULT_CONFIG.subTimeout, showFailedSub = DEFAULT_CONFIG.showFailedSub, subConverters = null } = options;
 	if (!api || api.length === 0) {
@@ -805,35 +810,52 @@ async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
 	let subStatus = [];
 
 	try {
-		// 使用Promise.allSettled等待所有API请求完成，无论成功或失败
-		const responses = await Promise.allSettled(api.map(apiUrl => fetchSubscription(apiUrl, 追加UA, userAgentHeader, { DEBUG, subRetry, subTimeout })));
+		// 分批并发抓取，避免瞬间洪峰 + 熔断检查
+		const now = Date.now();
+		const activeUrls = [];
+		for (const apiUrl of api) {
+			const cb = circuitBreaker.get(apiUrl);
+			if (cb && cb.cooldownUntil > now) {
+				subStatus.push(apiUrl + ' CIRCUIT_OPEN');
+				debugLog(DEBUG, `熔断跳过: ${apiUrl}`);
+				continue;
+			}
+			activeUrls.push(apiUrl);
+		}
+		const responses = [];
+		for (let i = 0; i < activeUrls.length; i += FETCH_CONCURRENCY) {
+			const batch = activeUrls.slice(i, i + FETCH_CONCURRENCY);
+			const batchResults = await Promise.allSettled(batch.map(apiUrl => fetchSubscription(apiUrl, 追加UA, userAgentHeader, { DEBUG, subRetry, subTimeout })));
+			batchResults.forEach((result, j) => {
+				responses.push({ apiUrl: batch[j], result });
+			});
+		}
 
 		// 遍历所有响应
-		const modifiedResponses = responses.map((response, index) => {
+		const modifiedResponses = responses.map((item) => {
+			const apiUrl = item.apiUrl;
+			const settled = item.result;
 			// 检查是否请求成功
-			if (response.status === 'rejected') {
-				const reason = response.reason;
-				if (reason && reason.name === 'AbortError') {
-					subStatus.push(api[index] + " TIMEOUT");
-					return {
-						status: '超时',
-						value: null,
-						apiUrl: api[index] // 将原始的apiUrl添加到返回对象中
-					};
+			if (settled.status === 'rejected') {
+				const reason = settled.reason;
+				// 熔断: 记录失败次数
+				const cb = circuitBreaker.get(apiUrl) || { failures: 0, cooldownUntil: 0 };
+				cb.failures++;
+				if (cb.failures > subRetry + 1) {
+					cb.cooldownUntil = Date.now() + CIRCUIT_COOLDOWN_MS;
 				}
-				subStatus.push(api[index] + " FAIL " + (reason.status || reason.name || "unknown"));
-				debugLog(DEBUG, `请求失败: ${api[index]}, 错误信息: ${reason.status} ${reason.statusText}`);
-				return {
-					status: '请求失败',
-					value: null,
-					apiUrl: api[index] // 将原始的apiUrl添加到返回对象中
-				};
+				circuitBreaker.set(apiUrl, cb);
+				if (reason && reason.name === 'AbortError') {
+					subStatus.push(apiUrl + " TIMEOUT");
+					return { status: '超时', value: null, apiUrl };
+				}
+				subStatus.push(apiUrl + " FAIL " + (reason.status || reason.name || "unknown"));
+				debugLog(DEBUG, `请求失败: ${apiUrl}, 错误信息: ${reason.status} ${reason.statusText}`);
+				return { status: '请求失败', value: null, apiUrl };
 			}
-			return {
-				status: response.status,
-				value: response.value,
-				apiUrl: api[index] // 将原始的apiUrl添加到返回对象中
-			};
+			// 成功: 重置熔断计数
+			circuitBreaker.delete(apiUrl);
+			return { status: settled.status, value: settled.value, apiUrl };
 		});
 
 		debugLog(DEBUG, modifiedResponses); // 输出修改后的响应数组
