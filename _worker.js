@@ -797,7 +797,7 @@ async function proxyURL(proxyURL, url, DEBUG = false) {
 // 熔断机制: 连续失败超过阈值的订阅链接暂时跳过
 const circuitBreaker = new Map(); // key: url, value: {failures, cooldownUntil}
 const CIRCUIT_COOLDOWN_MS = 300000; // 5分钟冷却期
-const FETCH_CONCURRENCY = 6; // 每批并发数
+const FETCH_CONCURRENCY = 8; // 每批并发数
 
 async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
 	const { DEBUG = false, subRetry = DEFAULT_CONFIG.subRetry, subTimeout = DEFAULT_CONFIG.subTimeout, showFailedSub = DEFAULT_CONFIG.showFailedSub, subConverters = null } = options;
@@ -841,7 +841,7 @@ async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
 				// 熔断: 记录失败次数
 				const cb = circuitBreaker.get(apiUrl) || { failures: 0, cooldownUntil: 0 };
 				cb.failures++;
-				if (cb.failures > subRetry + 1) {
+				if (cb.failures > subRetry) {
 					cb.cooldownUntil = Date.now() + CIRCUIT_COOLDOWN_MS;
 				}
 				circuitBreaker.set(apiUrl, cb);
