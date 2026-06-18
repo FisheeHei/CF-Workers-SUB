@@ -1,4 +1,4 @@
-
+﻿
 // 部署完成后在网址后面加上这个，获取自建节点和机场聚合节点，/?token=auto或/auto或
 
 const DEFAULT_CONFIG = {
@@ -621,13 +621,30 @@ function base64Decode(str) {
 }
 
 function tryDecodeBase64(str) {
-	const cleanStr = String(str || '').replace(/\s/g, '');
-	if (!cleanStr || cleanStr.length % 4 === 1 || !/^[A-Za-z0-9+/]+={0,2}$/.test(cleanStr)) return null;
-	try {
-		return base64Decode(cleanStr);
-	} catch (error) {
-		return null;
+	const raw = String(str || '');
+	if (!raw) return null;
+	// 方案1：标准base64（剥除非base64字符后重试）
+	const stdClean = raw.replace(/[^A-Za-z0-9+/=]/g, '');
+	if (stdClean && stdClean.length % 4 !== 1) {
+		try {
+			const decoded = base64Decode(stdClean);
+			if (decoded && /[a-z]+:\/\//.test(decoded)) return decoded;
+		} catch (_) {}
 	}
+	// 方案2：URL-safe base64（- 替换为 +, _ 替换为 /）
+	const urlClean = raw.replace(/[^A-Za-z0-9+/=_-]/g, '').replace(/-/g, '+').replace(/_/g, '/');
+	if (urlClean && urlClean.length % 4 !== 1) {
+		try {
+			const decoded = base64Decode(urlClean);
+			if (decoded && /[a-z]+:\/\//.test(decoded)) return decoded;
+		} catch (_) {}
+	}
+	// 方案3：保留原始严格检查（兼容旧行为）
+	const strictClean = raw.replace(/\s/g, '');
+	if (strictClean && strictClean.length % 4 !== 1 && /^[A-Za-z0-9+/]+={0,2}$/.test(strictClean)) {
+		try { return base64Decode(strictClean); } catch (_) {}
+	}
+	return null;
 }
 
 async function MD5MD5(text) {
@@ -829,9 +846,20 @@ async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
 						//console.log('Base64订阅: ' + response.apiUrl);
 						newapi += decodedContent + '\n'; // 解码并追加内容
 					} else {
+						// fallback: extract :// URIs from raw response
+						const rawLines = String(content || "").split(/[\r\n]+/);
+						let hasExtractedNodes = false;
+						for (const rawLine of rawLines) {
+							if (/^[a-z]+:\/\//i.test(rawLine.trim())) {
+								newapi += rawLine.trim() + "\n";
+								hasExtractedNodes = true;
+							}
+						}
+						if (!hasExtractedNodes) {
 						const 异常订阅LINK = `trojan://CMLiussss@127.0.0.1:8888?security=tls&allowInsecure=1&type=tcp&headerType=none#%E5%BC%82%E5%B8%B8%E8%AE%A2%E9%98%85%20${response.apiUrl.split('://')[1].split('/')[0]}`;
 						debugLog(DEBUG, '异常订阅: ' + 异常订阅LINK);
 						if (showFailedSub) 异常订阅 += `${异常订阅LINK}\n`;
+						}
 					}
 				}
 			}
