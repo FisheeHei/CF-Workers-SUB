@@ -26,7 +26,7 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-06-18-sub-fetch-diag";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-06-18-link-aware-cache";
 const BYTES_PER_TB = 1099511627776;
 const SUB_CONVERTER_STRATEGY = "adaptive-latency-aware";
 const SUB_CONVERTER_HEALTH_KEY = "__subapi_health_v1__";
@@ -356,9 +356,11 @@ export default {
 					return await KV(request, env, 'LINK.txt', 访客订阅, { FileName, mytoken, subConverterDisplay, subConverterStateBackend, subConfig, subRetry, subTimeout, subApiTimeout, subApiStagger, subCache, showFailedSub });
 				} else {
 					MainData = await env.KV.get('LINK.txt') || DEFAULT_MAIN_DATA;
+				const rawLinkContent = MainData;
 				}
 			} else {
 				MainData = env.LINK || DEFAULT_MAIN_DATA;
+				const rawLinkContent = MainData;
 				if (env.LINKSUB) urls = await ADD(env.LINKSUB);
 			}
 			let 重新汇总所有链接 = await ADD(MainData + '\n' + urls.join('\n'));
@@ -431,6 +433,7 @@ export default {
 				订阅格式,
 				subConverterDisplay,
 				subConfig,
+				rawLinkContent || '',
 			].join('\n---\n'));
 			订阅转换URL = `${订阅转换基础URL}&src=${sourceFingerprint}` + 订阅转换URL.slice(订阅转换基础URL.length);
 
@@ -443,6 +446,7 @@ export default {
 				env.WARP || '',
 				subConverterDisplay,
 				subConfig,
+				rawLinkContent || '',
 			].join('\n---\n');
 			const cacheKey = request.method === "GET" && subCache > 0
 				? new Request(`${url.origin}/__sub-cache/${await MD5MD5(cacheSeed)}`, { method: "GET" })
