@@ -26,7 +26,14 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-06-23-stale-cache";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-06-23-ua-rotation";
+// UA 轮换池：首轮用默认UA，重试时依次切换
+const UA_ROTATION_POOL = [
+	"ClashMeta/1.18 (https://github.com/MetaCubeX/clash.meta)",
+	"sing-box/1.10 (https://github.com/SagerNet/sing-box)",
+	"Stash/3.0 (https://stash.ws)",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+];
 const BYTES_PER_TB = 1099511627776;
 const SUB_CONVERTER_STRATEGY = "adaptive-latency-aware";
 const SUB_CONVERTER_HEALTH_KEY = "__subapi_health_v1__";
@@ -979,10 +986,12 @@ async function fetchSubscription(targetUrl, 追加UA, userAgentHeader, options =
 	const { DEBUG = false, subRetry = DEFAULT_CONFIG.subRetry, subTimeout = DEFAULT_CONFIG.subTimeout } = options;
 	let lastError;
 	for (let attempt = 0; attempt <= subRetry; attempt++) {
+		// 首轮用默认UA，重试时轮换到备选UA
+		const effectiveUA = attempt === 0 ? 追加UA : (UA_ROTATION_POOL[(attempt - 1) % UA_ROTATION_POOL.length]);
 		const controller = new AbortController();
 		const timeout = setTimeout(() => controller.abort(), subTimeout);
 		try {
-			const response = await getUrl(targetUrl, 追加UA, userAgentHeader, controller.signal, DEBUG);
+			const response = await getUrl(targetUrl, effectiveUA, userAgentHeader, controller.signal, DEBUG);
 			if (!response.ok) throw response;
 			return await response.text();
 		} catch (error) {
