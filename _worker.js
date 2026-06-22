@@ -26,7 +26,7 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-06-18-circuit-breaker";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-06-23-stale-cache";
 const BYTES_PER_TB = 1099511627776;
 const SUB_CONVERTER_STRATEGY = "adaptive-latency-aware";
 const SUB_CONVERTER_HEALTH_KEY = "__subapi_health_v1__";
@@ -272,6 +272,7 @@ function storeSubscriptionCache(cacheKey, response, subCache, ctx, DEBUG = false
 
 // KV 持久化缓存：订阅结果写入 KV，冷启动后无需重新抓取全量订阅链接
 const SUB_KV_PREFIX = "__sub:";
+const STALE_CACHE_PREFIX = "__stale:"; // 逐条订阅的失败回退缓存
 
 async function getSubFromKV(kv, cacheSeed) {
 	if (!kv) return null;
@@ -411,7 +412,7 @@ export default {
 			let selectedSubConverter = '';
 			let subStatus = [];
 			if (订阅链接数组.length > 0) {
-				const 请求订阅响应内容 = await getSUB(订阅链接数组, 追加UA, userAgentHeader, { DEBUG, subRetry, subTimeout, showFailedSub, subConverters });
+				const 请求订阅响应内容 = await getSUB(订阅链接数组, 追加UA, userAgentHeader, { DEBUG, subRetry, subTimeout, showFailedSub, subConverters, kv: env.KV, ctx });
 				debugLog(DEBUG, 请求订阅响应内容);
 				subStatus = 请求订阅响应内容[2] || [];
 				req_data += 请求订阅响应内容[0].join('\n');
@@ -800,7 +801,7 @@ const CIRCUIT_COOLDOWN_MS = 300000; // 5分钟冷却期
 const FETCH_CONCURRENCY = 8; // 每批并发数
 
 async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
-	const { DEBUG = false, subRetry = DEFAULT_CONFIG.subRetry, subTimeout = DEFAULT_CONFIG.subTimeout, showFailedSub = DEFAULT_CONFIG.showFailedSub, subConverters = null } = options;
+	const { DEBUG = false, subRetry = DEFAULT_CONFIG.subRetry, subTimeout = DEFAULT_CONFIG.subTimeout, showFailedSub = DEFAULT_CONFIG.showFailedSub, subConverters = null, kv = null, ctx = null } = options;
 	if (!api || api.length === 0) {
 		return [];
 	} else api = [...new Set(api)]; // 去重
@@ -898,6 +899,16 @@ async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
 				}
 			}
 		}
+		// 成功抓取的内容存入 stale KV 缓存（异步，不阻塞）
+		if (kv) {
+			for (const response of modifiedResponses) {
+				if (response.status === 'fulfilled' && response.value) {
+					const key = STALE_CACHE_PREFIX + await MD5MD5(response.apiUrl);
+					const staleContent = String(response.value || '').slice(0, 65536);
+					runInBackground(ctx, kv.put(key, staleContent, { expirationTtl: 86400 }), DEBUG);
+				}
+			}
+		}
 		// SUBAPI代理公底: 直连失败的订阅改走 SUBAPI 代为抓取
 		if (subConverters && subConverters.length > 0) {
 			const failedUrls = modifiedResponses.filter(r => r.status !== 'fulfilled');
@@ -923,6 +934,35 @@ async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
 					}
 				} catch (e) {
 					debugLog(DEBUG, `SUBAPI fallback failed for ${failed.apiUrl}:`, e.message || e);
+				}
+			}
+		}
+		// SUBAPI 也失败的订阅：尝试从 stale KV 缓存恢复
+		if (kv) {
+			for (const response of modifiedResponses) {
+				if (response.status !== 'fulfilled' && response.apiUrl) {
+					try {
+						const key = STALE_CACHE_PREFIX + await MD5MD5(response.apiUrl);
+						const staleValue = await kv.get(key);
+						if (staleValue) {
+							response.value = staleValue;
+							response.status = 'fulfilled';
+							response.fromStale = true;
+						}
+					} catch (e) { debugLog(DEBUG, 'stale cache read failed:', e?.message || e); }
+				}
+			}
+			// 从 stale cache 恢复的响应，立即在本轮处理
+			for (const response of modifiedResponses) {
+				if (response.fromStale && response.value) {
+					const staleContent = response.value;
+					const decoded = tryDecodeBase64(staleContent);
+					if (decoded) {
+						newapi += decoded + '\n';
+					} else if (/^[a-z]+:\/\//im.test(staleContent)) {
+						newapi += staleContent + '\n';
+					}
+					subStatus[subStatus.findIndex(s => s.startsWith(response.apiUrl))] = response.apiUrl + ' STALE_CACHE';
 				}
 			}
 		}
