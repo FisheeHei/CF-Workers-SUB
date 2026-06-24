@@ -26,7 +26,7 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-06-24-memory-stale-cache";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-06-24-distinct-nginx";
 // UA 轮换池：首轮用默认UA，重试时依次切换
 // LINK.txt 内存缓存：避免每次请求读KV + 用户编辑后 30s 内生效
 const LINK_TEXT_CACHE = { value: null, ts: 0 };
@@ -335,7 +335,6 @@ export default {
 		let guestToken = env.GUESTTOKEN || env.GUEST || DEFAULT_CONFIG.guestToken;
 		if (!guestToken) guestToken = await MD5MD5(mytoken);
 		const 访客订阅 = guestToken;
-		//console.log(`${fakeUserID}\n${fakeHostName}`); // 打印fakeID
 
 		const timestamp = DEFAULT_CONFIG.timestamp;
 		const total = DEFAULT_CONFIG.totalTB * BYTES_PER_TB;
@@ -414,7 +413,6 @@ export default {
 			let subConverterUrl;
 			const 订阅转换基础URL = `${url.origin}/${await MD5MD5(fakeToken)}?token=${fakeToken}`;
 			let 订阅转换URL = 订阅转换基础URL;
-			//console.log(订阅转换URL);
 			let req_data = MainData;
 
 			let 追加UA = 'v2rayn';
@@ -487,7 +485,6 @@ export default {
 			//去重
 			const uniqueLines = new Set(text.split('\n'));
 			const result = [...uniqueLines].join('\n');
-			//console.log(result);
 			let base64Data = kvCachedBase64 || null;
 			if (!base64Data) {
 			try {
@@ -550,7 +547,6 @@ export default {
 			} else if (订阅格式 == 'loon') {
 				subConverterUrl = converter => buildSubConverterUrl(converter, 'loon', 订阅转换URL, subConfig);
 			}
-			//console.log(订阅转换URL);
 			try {
 				const converterResult = await fetchSubConverterText(subConverters, subConverterUrl, { 'User-Agent': userAgentHeader }, { DEBUG, subApiTimeout, subApiStagger, kv: env.KV, ctx });//订阅转换
 				selectedSubConverter = converterResult.converter || selectedSubConverter;
@@ -584,7 +580,6 @@ function summarizeLinks(envadd) {
 
 async function ADD(envadd) {
 	const add = splitLinkText(envadd);
-	//console.log(add);
 	return add;
 }
 
@@ -595,27 +590,21 @@ async function nginx() {
 	<head>
 	<title>Welcome to nginx!</title>
 	<style>
-		body {
-			width: 35em;
-			margin: 0 auto;
-			font-family: Tahoma, Verdana, Arial, sans-serif;
-		}
+		body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-serif; }
+		h1 { color: #1a73e8; }
+		.footer { color: #999; font-size: 12px; margin-top: 2em; }
+		.highlight { background: linear-gradient(90deg, #1a73e8, #34a853); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
 	</style>
 	</head>
 	<body>
 	<h1>Welcome to nginx!</h1>
-	<p>If you see this page, the nginx web server is successfully installed and
-	working. Further configuration is required.</p>
-	
-	<p>For online documentation and support please refer to
-	<a href="http://nginx.org/">nginx.org</a>.<br/>
-	Commercial support is available at
-	<a href="http://nginx.com/">nginx.com</a>.</p>
-	
-	<p><em>Thank you for using nginx.</em></p>
+	<p>If you see this page, the nginx web server is successfully installed and working. Further configuration is required.</p>
+	<p class="highlight">Powered by Cloudflare Workers</p>
+	<hr>
+	<p class="footer"><em>Thank you for using nginx.</em> &middot; Custom Edition</p>
 	</body>
 	</html>
-	`
+	`;
 	return text;
 }
 
@@ -888,18 +877,14 @@ async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
 				subStatus.push(response.apiUrl + " OK");
 				const content = await response.value || 'null'; // 获取响应的内容
 				if (content.includes('proxies:')) {
-					//console.log('Clash订阅: ' + response.apiUrl);
 					订阅转换URLs += "|" + response.apiUrl; // Clash 配置
 				} else if (content.includes('outbounds"') && content.includes('inbounds"')) {
-					//console.log('Singbox订阅: ' + response.apiUrl);
 					订阅转换URLs += "|" + response.apiUrl; // Singbox 配置
 				} else if (content.includes('://')) {
-					//console.log('明文订阅: ' + response.apiUrl);
 					newapi += content + '\n'; // 追加内容
 				} else {
 					const decodedContent = tryDecodeBase64(content);
 					if (decodedContent !== null) {
-						//console.log('Base64订阅: ' + response.apiUrl);
 						newapi += decodedContent + '\n'; // 解码并追加内容
 					} else {
 						// fallback: extract :// URIs from raw response
