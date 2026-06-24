@@ -113,8 +113,6 @@
 | SUBAPISTAGGER | `250` | ❌ | 多个订阅转换后端的错峰并发间隔，单位毫秒；`0` 为完全串行，范围 `0-3000` |
 | SUBCACHE | `300` | ❌ | 订阅结果缓存时间，单位秒；设为 `0` 可关闭缓存，范围 `0-3600` |
 | SHOW_FAILED_SUB | `0` | ❌ | 是否在订阅结果里显示异常订阅占位节点；`1/true/yes/on` 为开启 |
-| CF_ACCOUNT_ID | your-account-id | ❌ | Cloudflare 账号 ID，用于在仪表盘显示 KV 配额使用量 |
-| CF_API_TOKEN | your-api-token | ❌ | Cloudflare API Token（需 KV Analytics 读取权限），配合 CF_ACCOUNT_ID 使用 |
 
 
 ## ⚠️ 注意事项
