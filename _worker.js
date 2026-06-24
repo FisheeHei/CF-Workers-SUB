@@ -26,7 +26,7 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-06-24-kv-dashboard-v3";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-06-24-kv-dashboard-v4";
 // UA 轮换池：首轮用默认UA，重试时依次切换
 // LINK.txt 内存缓存：避免每次请求读KV + 用户编辑后 30s 内生效
 const LINK_TEXT_CACHE = { value: null, ts: 0 };
@@ -1050,7 +1050,7 @@ async function fetchKvUsage(accountId, apiToken) {
 	try {
 		const query = JSON.stringify({
 			query: '{viewer{accounts(filter:{accountTag:"' + accountId + '"}){' +
-				'kvOperationsAdaptiveGroups(limit:1, orderBy:[datetime_DESC])' +
+				'kvOperationsAdaptiveGroups(limit:1)' +
 				'{sum{requests}}' +
 			'}}}'
 		});
