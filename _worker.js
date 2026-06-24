@@ -1070,10 +1070,10 @@ async function fetchKvUsage(accountId, apiToken) {
 		if (!resp.ok) return { ok: false, reason: 'http_' + resp.status };
 		const data = await resp.json();
 		if (data.errors && data.errors.length > 0) {
-			const msg = data.errors[0].message || '';
+			const msg = data.errors[0].message || data.errors[0].path || '';
 			if (msg.includes('permission') || msg.includes('Unauthorized') || msg.includes('authorization') || msg.includes('Authentication'))
 				return { ok: false, reason: 'token_permission' };
-			return { ok: false, reason: 'graphql_error' };
+			return { ok: false, reason: 'graphql_error: ' + msg };
 		}
 		const groups = data?.data?.viewer?.accounts?.[0]?.kvNamespaceAnalyticsAdaptiveGroups;
 		if (!groups || groups.length === 0) return { ok: false, reason: 'no_data' };
