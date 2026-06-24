@@ -1059,7 +1059,7 @@ async function fetchKvUsage(accountId, apiToken) {
 					'limit:1,' +
 					'filter:{datetime_geq:"' + dayStart.toISOString() + '",datetime_lt:"' + dayEnd.toISOString() + '"}' +
 					'orderBy:[datetime_DESC]' +
-				'){sum{requests reads writes}}' +
+				'){sum{requests}}' +
 			'}}}'
 		});
 		const resp = await fetch('https://api.cloudflare.com/client/v4/graphql', {
@@ -1078,7 +1078,7 @@ async function fetchKvUsage(accountId, apiToken) {
 		const groups = data?.data?.viewer?.accounts?.[0]?.kvOperationsAdaptiveGroups;
 		if (!groups || groups.length === 0) return { ok: false, reason: 'no_data' };
 		const sum = groups[0].sum;
-		return { ok: true, reads: sum.reads || 0, writes: sum.writes || 0 };
+		return { ok: true, requests: sum.requests || 0 };
 	} catch (e) { return { ok: false, reason: 'exception' }; }
 }
 
@@ -1153,16 +1153,12 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 				if (usage && usage.ok) {
 					const reads = usage.reads || 0;
 					const writes = usage.writes || 0;
-					const readPct = (reads / readLimit * 100).toFixed(1);
-					const writePct = (writes / writeLimit * 100).toFixed(1);
-					const readBarLen = Math.round(parseFloat(readPct) / 10) || 0;
-					const writeBarLen = Math.round(parseFloat(writePct) / 10) || 0;
-					const readBar = '\u2588'.repeat(readBarLen) + '\u2591'.repeat(10 - readBarLen);
-					const writeBar = '\u2588'.repeat(writeBarLen) + '\u2591'.repeat(10 - writeBarLen);
+					const reqPct = (requests / readLimit * 100).toFixed(1);
+					const barLen = Math.round(parseFloat(reqPct) / 10) || 0;
+					const bar = '\u2588'.repeat(barLen) + '\u2591'.repeat(10 - barLen);
 					kvUsageBars = '---------------------------------------------------------------<br>\n' +
 						'KV \u5168\u8d26\u53f7\u914d\u989d\u4f7f\u7528\uff08\u4eca\u65e5 UTC' + planLabel + '\uff09<br>\n' +
-						'KV Reads : ' + readBar + ' ' + reads.toLocaleString() + ' / ' + readLimit.toLocaleString() + ' (' + readPct + '%)<br>\n' +
-						'KV Writes: ' + writeBar + ' ' + writes.toLocaleString() + ' / ' + writeLimit.toLocaleString() + ' (' + writePct + '%)<br>\n' +
+						'KV Requests: ' + bar + ' ' + requests.toLocaleString() + ' / ' + readLimit.toLocaleString() + ' (' + reqPct + '%)<br>\n' +
 						'---------------------------------------------------------------<br>';
 				} else if (usage && usage.reason === 'token_permission') {
 					kvUsageBars = '---------------------------------------------------------------<br>\n' +
