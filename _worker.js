@@ -26,7 +26,7 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-06-24-kv-dashboard-v2";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-06-24-kv-dashboard-v3";
 // UA 轮换池：首轮用默认UA，重试时依次切换
 // LINK.txt 内存缓存：避免每次请求读KV + 用户编辑后 30s 内生效
 const LINK_TEXT_CACHE = { value: null, ts: 0 };
@@ -1048,18 +1048,10 @@ async function 迁移地址列表(env, txt = 'ADD.txt') {
 async function fetchKvUsage(accountId, apiToken) {
 	if (!accountId || !apiToken) return { ok: false, reason: 'no_credentials' };
 	try {
-		const today = new Date();
-		const dayStart = new Date(today);
-		dayStart.setHours(0, 0, 0, 0);
-		const dayEnd = new Date(dayStart);
-		dayEnd.setDate(dayEnd.getDate() + 1);
 		const query = JSON.stringify({
 			query: '{viewer{accounts(filter:{accountTag:"' + accountId + '"}){' +
-				'kvOperationsAdaptiveGroups(' +
-					'limit:1,' +
-					'filter:{datetime_geq:"' + dayStart.toISOString() + '",datetime_lt:"' + dayEnd.toISOString() + '"}' +
-					'orderBy:[datetime_DESC]' +
-				'){sum{requests}}' +
+				'kvOperationsAdaptiveGroups(limit:1, orderBy:[datetime_DESC])' +
+				'{sum{requests}}' +
 			'}}}'
 		});
 		const resp = await fetch('https://api.cloudflare.com/client/v4/graphql', {
@@ -1157,7 +1149,7 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 					const barLen = Math.round(parseFloat(reqPct) / 10) || 0;
 					const bar = '\u2588'.repeat(barLen) + '\u2591'.repeat(10 - barLen);
 					kvUsageBars = '---------------------------------------------------------------<br>\n' +
-						'KV \u5168\u8d26\u53f7\u914d\u989d\u4f7f\u7528\uff08\u4eca\u65e5 UTC' + planLabel + '\uff09<br>\n' +
+						'KV \u5168\u8d26\u53f7\u914d\u989d\u4f7f\u7528\uff08\u914d\u989d\u6bcf\u65e5 00:00 UTC \u91cd\u7f6e' + planLabel + '\uff09<br>\n' +
 						'KV Requests: ' + bar + ' ' + requests.toLocaleString() + ' / ' + readLimit.toLocaleString() + ' (' + reqPct + '%)<br>\n' +
 						'---------------------------------------------------------------<br>';
 				} else if (usage && usage.reason === 'token_permission') {
