@@ -1,4 +1,4 @@
-# 更新日志
+﻿# 更新日志
 
 ## custom-fix-preview - 2026-06-18
 
@@ -34,3 +34,5 @@
 - 新增 `SHOW_FAILED_SUB`，可控制是否在订阅结果中显示异常订阅占位节点。
 - `/TOKEN` 编辑页增加当前变量状态、版本标记和链接数量统计。
 - 删除自动同步上游仓库的 GitHub Actions workflow。
+
+- 2026-06-24: reconfigure SUBCACHE
