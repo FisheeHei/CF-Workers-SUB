@@ -1056,7 +1056,9 @@ async function fetchKvUsage(accountId, apiToken) {
 		const query = JSON.stringify({
 			query: '{viewer{accounts(filter:{accountTag:"' + accountId + '"}){' +
 				'kvOperationsAdaptiveGroups(' +
+					'limit:1,' +
 					'filter:{datetime_geq:"' + dayStart.toISOString() + '",datetime_lt:"' + dayEnd.toISOString() + '"}' +
+					'orderBy:[datetime_DESC]' +
 				'){sum{requests}}' +
 			'}}}'
 		});
