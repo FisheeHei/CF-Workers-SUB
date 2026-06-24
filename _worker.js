@@ -326,6 +326,8 @@ export default {
 		const subApiStagger = normalizeNumber(env.SUBAPISTAGGER, DEFAULT_CONFIG.subApiStagger, 0, 3000);
 		const subCache = normalizeNumber(env.SUBCACHE, DEFAULT_CONFIG.subCache, 0, 3600);
 		const showFailedSub = normalizeBoolean(env.SHOW_FAILED_SUB, DEFAULT_CONFIG.showFailedSub);
+		const cfAccountId = env.CF_ACCOUNT_ID || '';
+		const cfApiToken = env.CF_API_TOKEN || '';
 		const refreshCache = url.searchParams.has('refresh');
 
 		const currentDate = new Date();
@@ -366,7 +368,7 @@ export default {
 				await 迁移地址列表(env, 'LINK.txt');
 				if (userAgent.includes('mozilla') && !url.search) {
 					runInBackground(ctx, sendMessage(`#编辑订阅 ${FileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgentHeader}</tg-spoiler>\n域名: ${url.hostname}\n<tg-spoiler>入口: ${url.pathname + url.search}</tg-spoiler>`, { BotToken, ChatID }), DEBUG);
-					return await KV(request, env, 'LINK.txt', 访客订阅, { FileName, mytoken, subConverterDisplay, subConverterStateBackend, subConfig, subRetry, subTimeout, subApiTimeout, subApiStagger, subCache, showFailedSub });
+					return await KV(request, env, 'LINK.txt', 访客订阅, { FileName, mytoken, subConverterDisplay, subConverterStateBackend, subConfig, subRetry, subTimeout, subApiTimeout, subApiStagger, subCache, showFailedSub, cfAccountId, cfApiToken });
 				} else {
 					const now = Date.now();
 				if (now - LINK_TEXT_CACHE.ts > LINK_TEXT_CACHE_TTL) {
@@ -1041,6 +1043,35 @@ async function 迁移地址列表(env, txt = 'ADD.txt') {
 	return false;
 }
 
+
+
+async function fetchKvUsage(accountId, apiToken) {
+	if (!accountId || !apiToken) return null;
+	try {
+		const today = new Date();
+		today.setHours(0, 0, 0, 0);
+		const query = JSON.stringify({
+			query: '{viewer{accounts(filter:{accountTag:"' + accountId + '"}){' +
+				'kvNamespaceAnalyticsAdaptiveGroups(' +
+					'limit:1,' +
+					'filter:{datetime_gt:"' + today.toISOString() + '"}' +
+					'orderBy:[datetime_DESC]' +
+				'){sum{requests reads writes}}' +
+			'}}}'
+		});
+		const resp = await fetch('https://api.cloudflare.com/client/v4/graphql', {
+			method: 'POST',
+			headers: { "Authorization": "Bearer " + apiToken, "Content-Type": "application/json" },
+			body: query,
+		});
+		if (!resp.ok) return null;
+		const data = await resp.json();
+		const groups = data?.data?.viewer?.accounts?.[0]?.kvNamespaceAnalyticsAdaptiveGroups;
+		if (!groups || groups.length === 0) return null;
+		return groups[0].sum || null;
+	} catch (e) { return null; }
+}
+
 async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 	const {
 		FileName = DEFAULT_CONFIG.fileName,
@@ -1054,6 +1085,8 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 		subApiStagger = DEFAULT_CONFIG.subApiStagger,
 		subCache = DEFAULT_CONFIG.subCache,
 		showFailedSub = DEFAULT_CONFIG.showFailedSub,
+		cfAccountId = '',
+		cfApiToken = '',
 	} = config;
 	const url = new URL(request.url);
 	try {
@@ -1083,6 +1116,38 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 			}
 		}
 		const stats = summarizeLinks(content);
+		let kvUsageBars = '';
+		if (cfAccountId && cfApiToken) {
+			try {
+				const usage = await fetchKvUsage(cfAccountId, cfApiToken);
+				if (usage) {
+					const reads = usage.reads || 0;
+					const writes = usage.writes || 0;
+					const readPct = Math.min(reads / 100000 * 100, 100);
+					const writePct = Math.min(writes / 1000 * 100, 100);
+					kvUsageBars = '---------------------------------------------------------------<br>\n' +
+						'KV \u5168\u8d26\u53f7\u914d\u989d\u4f7f\u7528\uff08\u4eca\u65e5\uff09<br>\n' +
+						'KV Reads: <span style="color:#' + (readPct > 80 ? 'e53e3e' : '666') + '">' + reads.toLocaleString() + '</span> / 100,000<br>\n' +
+						'<div style="background:#eee;border-radius:4px;height:12px;width:300px;overflow:hidden">\n' +
+						'\t<div style="background:' + (readPct > 80 ? '#e53e3e' : '#4CAF50') + ';width:' + readPct + '%;height:12px;border-radius:4px"></div>\n' +
+						'</div><br>\n' +
+						'KV Writes: <span style="color:#' + (writePct > 80 ? 'e53e3e' : '666') + '">' + writes.toLocaleString() + '</span> / 1,000<br>\n' +
+						'<div style="background:#eee;border-radius:4px;height:12px;width:300px;overflow:hidden">\n' +
+						'\t<div style="background:' + (writePct > 80 ? '#e53e3e' : '#2196F3') + ';width:' + writePct + '%;height:12px;border-radius:4px"></div>\n' +
+						'</div><br>\n' +
+						'---------------------------------------------------------------<br>';
+				} else {
+					kvUsageBars = '---------------------------------------------------------------<br>\n' +
+						'KV \u914d\u989d\u67e5\u8be2\u5931\u8d25\uff08\u8bf7\u68c0\u67e5 Account ID / API Token\uff09<br>\n' +
+						'---------------------------------------------------------------<br>';
+				}
+			} catch (e) {
+				kvUsageBars = '---------------------------------------------------------------<br>\n' +
+					'KV \u67e5\u8be2\u5f02\u5e38<br>\n' +
+					'---------------------------------------------------------------<br>';
+			}
+		}
+
 
 		const html = `
 			<!DOCTYPE html>
@@ -1207,6 +1272,7 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 					<!-- SUBCACHE: <strong>${subCache}s</strong><br> -->
 					<!-- SHOW_FAILED_SUB: <strong>${showFailedSub ? '1' : '0'}</strong><br> -->
 					VERSION（部署标记）: <strong>${CUSTOM_FIX_VERSION}</strong><br>
+					${kvUsageBars}
 					---------------------------------------------------------------<br>
 					################################################################<br>
 					${FileName} 汇聚订阅编辑:
