@@ -26,8 +26,11 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-06-23-ua-rotation";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-06-24-memory-stale-cache";
 // UA 轮换池：首轮用默认UA，重试时依次切换
+// LINK.txt 内存缓存：避免每次请求读KV + 用户编辑后 30s 内生效
+const LINK_TEXT_CACHE = { value: null, ts: 0 };
+const LINK_TEXT_CACHE_TTL = 30000;
 const UA_ROTATION_POOL = [
 	"ClashMeta/1.18 (https://github.com/MetaCubeX/clash.meta)",
 	"sing-box/1.10 (https://github.com/SagerNet/sing-box)",
@@ -279,7 +282,8 @@ function storeSubscriptionCache(cacheKey, response, subCache, ctx, DEBUG = false
 
 // KV 持久化缓存：订阅结果写入 KV，冷启动后无需重新抓取全量订阅链接
 const SUB_KV_PREFIX = "__sub:";
-const STALE_CACHE_PREFIX = "__stale:"; // 逐条订阅的失败回退缓存
+// 订阅失败回退缓存（内存，不写KV）
+const staleCache = new Map(); // key: url, value: {content, expiresAt}
 
 async function getSubFromKV(kv, cacheSeed) {
 	if (!kv) return null;
@@ -354,7 +358,8 @@ export default {
 				}),
 			});
 		} else {
-			if (subConverters.length > 0) await loadPersistedSubConverterHealth(env.KV, subConverters, DEBUG);
+			// KV converter health persistence disabled per request to reduce KV ops
+		// if (subConverters.length > 0) await loadPersistedSubConverterHealth(env.KV, subConverters, DEBUG);
 			let MainData = DEFAULT_MAIN_DATA;
 		let rawLinkContent = MainData;
 			let urls = [];
@@ -364,7 +369,12 @@ export default {
 					runInBackground(ctx, sendMessage(`#编辑订阅 ${FileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgentHeader}</tg-spoiler>\n域名: ${url.hostname}\n<tg-spoiler>入口: ${url.pathname + url.search}</tg-spoiler>`, { BotToken, ChatID }), DEBUG);
 					return await KV(request, env, 'LINK.txt', 访客订阅, { FileName, mytoken, subConverterDisplay, subConverterStateBackend, subConfig, subRetry, subTimeout, subApiTimeout, subApiStagger, subCache, showFailedSub });
 				} else {
-					MainData = await env.KV.get('LINK.txt') || DEFAULT_MAIN_DATA;
+					const now = Date.now();
+				if (now - LINK_TEXT_CACHE.ts > LINK_TEXT_CACHE_TTL) {
+					LINK_TEXT_CACHE.value = await env.KV.get('LINK.txt');
+					LINK_TEXT_CACHE.ts = now;
+				}
+				MainData = LINK_TEXT_CACHE.value ?? DEFAULT_MAIN_DATA;
 				rawLinkContent = MainData;
 				}
 			} else {
@@ -461,9 +471,9 @@ export default {
 				? new Request(`${url.origin}/__sub-cache/${await MD5MD5(cacheSeed)}`, { method: "GET" })
 				: null;
 			const cachedResponse = refreshCache ? null : await getSubscriptionCache(cacheKey, DEBUG);
-			// KV 缓存回退：memory 未命中时尝试 KV（避免冷启动后重复抓取订阅）
+			// KV 缓存回退：仅在 SUBCACHE < 300 时使用，避免频繁读写KV
 			let kvCachedBase64 = null;
-			if (!cachedResponse && env.KV) {
+			if (!cachedResponse && env.KV && subCache < 300) {
 				kvCachedBase64 = await getSubFromKV(env.KV, cacheSeed);
 			}
 			if (cachedResponse) return cachedResponse;
@@ -508,7 +518,10 @@ export default {
 			} // end if (!base64Data)
 
 			// 写入 KV 持久化缓存（异步，不阻塞响应）
+			// 仅在冷启动时写KV缓存（减少KV写入）
+			if (!kvCachedBase64 && subCache < 300) {
 			putSubToKV(env.KV, cacheSeed, base64Data, subCache, ctx);
+			}
 
 			// 构建响应头对象
 			const responseHeaders = {
@@ -758,7 +771,8 @@ async function fetchSubConverterText(converters, buildUrl, headers, options = {}
 		const lastError = error?.errors?.[error.errors.length - 1];
 		throw lastError || error || new Error('所有订阅转换后端均不可用');
 	} finally {
-		runInBackground(ctx, persistSubConverterHealth(kv, prioritizedConverters, DEBUG), DEBUG);
+		// KV converter health persistence disabled - use in-memory only
+		// runInBackground(ctx, persistSubConverterHealth(kv, prioritizedConverters, DEBUG), DEBUG);
 	}
 }
 
@@ -906,14 +920,11 @@ async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
 				}
 			}
 		}
-		// 成功抓取的内容存入 stale KV 缓存（异步，不阻塞）
-		if (kv) {
-			for (const response of modifiedResponses) {
-				if (response.status === 'fulfilled' && response.value) {
-					const key = STALE_CACHE_PREFIX + await MD5MD5(response.apiUrl);
-					const staleContent = String(response.value || '').slice(0, 65536);
-					runInBackground(ctx, kv.put(key, staleContent, { expirationTtl: 86400 }), DEBUG);
-				}
+		// 成功抓取的内容存入内存 stale cache（不写KV）
+		for (const response of modifiedResponses) {
+			if (response.status === 'fulfilled' && response.value) {
+				const staleContent = String(response.value || '').slice(0, 65536);
+				staleCache.set(response.apiUrl, { content: staleContent, expiresAt: Date.now() + 86400000 });
 			}
 		}
 		// SUBAPI代理公底: 直连失败的订阅改走 SUBAPI 代为抓取
@@ -944,33 +955,28 @@ async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
 				}
 			}
 		}
-		// SUBAPI 也失败的订阅：尝试从 stale KV 缓存恢复
-		if (kv) {
-			for (const response of modifiedResponses) {
-				if (response.status !== 'fulfilled' && response.apiUrl) {
-					try {
-						const key = STALE_CACHE_PREFIX + await MD5MD5(response.apiUrl);
-						const staleValue = await kv.get(key);
-						if (staleValue) {
-							response.value = staleValue;
-							response.status = 'fulfilled';
-							response.fromStale = true;
-						}
-					} catch (e) { debugLog(DEBUG, 'stale cache read failed:', e?.message || e); }
+		// SUBAPI 也失败的订阅：尝试从内存 stale cache 恢复
+		for (const response of modifiedResponses) {
+			if (response.status !== 'fulfilled' && response.apiUrl) {
+				const cached = staleCache.get(response.apiUrl);
+				if (cached && cached.expiresAt > Date.now() && cached.content) {
+					response.value = cached.content;
+					response.status = 'fulfilled';
+					response.fromStale = true;
 				}
 			}
-			// 从 stale cache 恢复的响应，立即在本轮处理
-			for (const response of modifiedResponses) {
-				if (response.fromStale && response.value) {
-					const staleContent = response.value;
-					const decoded = tryDecodeBase64(staleContent);
-					if (decoded) {
-						newapi += decoded + '\n';
-					} else if (/^[a-z]+:\/\//im.test(staleContent)) {
-						newapi += staleContent + '\n';
-					}
-					subStatus[subStatus.findIndex(s => s.startsWith(response.apiUrl))] = response.apiUrl + ' STALE_CACHE';
+		}
+		// 从 stale cache 恢复的响应，立即在本轮处理
+		for (const response of modifiedResponses) {
+			if (response.fromStale && response.value) {
+				const staleContent = response.value;
+				const decoded = tryDecodeBase64(staleContent);
+				if (decoded) {
+					newapi += decoded + '\n';
+				} else if (/^[a-z]+:\/\//im.test(staleContent)) {
+					newapi += staleContent + '\n';
 				}
+				subStatus[subStatus.findIndex(s => s.startsWith(response.apiUrl))] = response.apiUrl + ' STALE_CACHE';
 			}
 		}
 	} catch (error) {
