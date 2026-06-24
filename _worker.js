@@ -1055,7 +1055,7 @@ async function fetchKvUsage(accountId, apiToken) {
 		dayEnd.setDate(dayEnd.getDate() + 1);
 		const query = JSON.stringify({
 			query: '{viewer{accounts(filter:{accountTag:"' + accountId + '"}){' +
-				'kvNamespaceAnalyticsAdaptiveGroups(' +
+				'kvAnalyticsAdaptiveGroups(' +
 					'limit:1,' +
 					'filter:{datetime_geq:"' + dayStart.toISOString() + '",datetime_lt:"' + dayEnd.toISOString() + '"}' +
 					'orderBy:[datetime_DESC]' +
@@ -1075,7 +1075,7 @@ async function fetchKvUsage(accountId, apiToken) {
 				return { ok: false, reason: 'token_permission' };
 			return { ok: false, reason: 'graphql_error: ' + msg };
 		}
-		const groups = data?.data?.viewer?.accounts?.[0]?.kvNamespaceAnalyticsAdaptiveGroups;
+		const groups = data?.data?.viewer?.accounts?.[0]?.kvAnalyticsAdaptiveGroups;
 		if (!groups || groups.length === 0) return { ok: false, reason: 'no_data' };
 		const sum = groups[0].sum;
 		return { ok: true, reads: sum.reads || 0, writes: sum.writes || 0 };
