@@ -1135,10 +1135,14 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 					const writes = usage.writes || 0;
 					const readPct = (reads / 100000 * 100).toFixed(1);
 					const writePct = (writes / 1000 * 100).toFixed(1);
+					const readBarLen = Math.round(parseFloat(readPct) / 10) || 0;
+					const writeBarLen = Math.round(parseFloat(writePct) / 10) || 0;
+					const readBar = '\u2588'.repeat(readBarLen) + '\u2591'.repeat(10 - readBarLen);
+					const writeBar = '\u2588'.repeat(writeBarLen) + '\u2591'.repeat(10 - writeBarLen);
 					kvUsageBars = '---------------------------------------------------------------<br>\n' +
 						'KV \u5168\u8d26\u53f7\u914d\u989d\u4f7f\u7528\uff08\u4eca\u65e5 UTC\uff09<br>\n' +
-						'KV Reads: ' + reads.toLocaleString() + ' / 100,000 (' + readPct + '%)<br>\n' +
-						'KV Writes: ' + writes.toLocaleString() + ' / 1,000 (' + writePct + '%)<br>\n' +
+						'KV Reads : ' + readBar + ' ' + reads.toLocaleString() + ' / 100,000 (' + readPct + '%)<br>\n' +
+						'KV Writes: ' + writeBar + ' ' + writes.toLocaleString() + ' / 1,000 (' + writePct + '%)<br>\n' +
 						'---------------------------------------------------------------<br>';
 				} else if (usage && usage.reason === 'token_permission') {
 					kvUsageBars = '---------------------------------------------------------------<br>\n' +
