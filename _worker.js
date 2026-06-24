@@ -1055,7 +1055,7 @@ async function fetchKvUsage(accountId, apiToken) {
 		dayEnd.setDate(dayEnd.getDate() + 1);
 		const query = JSON.stringify({
 			query: '{viewer{accounts(filter:{accountTag:"' + accountId + '"}){' +
-				'kvAnalyticsAdaptiveGroups(' +
+				'kvOperationsAdaptiveGroups(' +
 					'limit:1,' +
 					'filter:{datetime_geq:"' + dayStart.toISOString() + '",datetime_lt:"' + dayEnd.toISOString() + '"}' +
 					'orderBy:[datetime_DESC]' +
@@ -1075,12 +1075,27 @@ async function fetchKvUsage(accountId, apiToken) {
 				return { ok: false, reason: 'token_permission' };
 			return { ok: false, reason: 'graphql_error: ' + msg };
 		}
-		const groups = data?.data?.viewer?.accounts?.[0]?.kvAnalyticsAdaptiveGroups;
+		const groups = data?.data?.viewer?.accounts?.[0]?.kvOperationsAdaptiveGroups;
 		if (!groups || groups.length === 0) return { ok: false, reason: 'no_data' };
 		const sum = groups[0].sum;
 		return { ok: true, reads: sum.reads || 0, writes: sum.writes || 0 };
 	} catch (e) { return { ok: false, reason: 'exception' }; }
 }
+
+async function fetchAccountPlan(accountId, apiToken) {
+	try {
+		const resp = await fetch('https://api.cloudflare.com/client/v4/accounts/' + accountId + '/subscriptions', {
+			headers: { "Authorization": "Bearer " + apiToken, "Content-Type": "application/json" },
+		});
+		if (!resp.ok) return null;
+		const data = await resp.json();
+		if (!data.success || !data.result || data.result.length === 0) return null;
+		const sub = data.result[0];
+		const planName = (sub.plan && sub.plan.name) || (sub.rate_plan && sub.rate_plan.public_name) || '';
+		return { plan: planName, isPaid: sub.plan && sub.plan.is_paid, frequency: sub.frequency };
+	} catch (e) { return null; }
+}
+
 
 async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 	const {
@@ -1130,19 +1145,24 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 		if (cfAccountId && cfApiToken) {
 			try {
 				const usage = await fetchKvUsage(cfAccountId, cfApiToken);
+				const planInfo = await fetchAccountPlan(cfAccountId, cfApiToken);
+				const isPaid = planInfo && planInfo.isPaid;
+				const readLimit = isPaid ? 10000000 : 100000;
+				const writeLimit = isPaid ? 1000000 : 1000;
+				const planLabel = isPaid ? ' (Paid)' : ' (Free)';
 				if (usage && usage.ok) {
 					const reads = usage.reads || 0;
 					const writes = usage.writes || 0;
-					const readPct = (reads / 100000 * 100).toFixed(1);
-					const writePct = (writes / 1000 * 100).toFixed(1);
+					const readPct = (reads / readLimit * 100).toFixed(1);
+					const writePct = (writes / writeLimit * 100).toFixed(1);
 					const readBarLen = Math.round(parseFloat(readPct) / 10) || 0;
 					const writeBarLen = Math.round(parseFloat(writePct) / 10) || 0;
 					const readBar = '\u2588'.repeat(readBarLen) + '\u2591'.repeat(10 - readBarLen);
 					const writeBar = '\u2588'.repeat(writeBarLen) + '\u2591'.repeat(10 - writeBarLen);
 					kvUsageBars = '---------------------------------------------------------------<br>\n' +
-						'KV \u5168\u8d26\u53f7\u914d\u989d\u4f7f\u7528\uff08\u4eca\u65e5 UTC\uff09<br>\n' +
-						'KV Reads : ' + readBar + ' ' + reads.toLocaleString() + ' / 100,000 (' + readPct + '%)<br>\n' +
-						'KV Writes: ' + writeBar + ' ' + writes.toLocaleString() + ' / 1,000 (' + writePct + '%)<br>\n' +
+						'KV \u5168\u8d26\u53f7\u914d\u989d\u4f7f\u7528\uff08\u4eca\u65e5 UTC' + planLabel + '\uff09<br>\n' +
+						'KV Reads : ' + readBar + ' ' + reads.toLocaleString() + ' / ' + readLimit.toLocaleString() + ' (' + readPct + '%)<br>\n' +
+						'KV Writes: ' + writeBar + ' ' + writes.toLocaleString() + ' / ' + writeLimit.toLocaleString() + ' (' + writePct + '%)<br>\n' +
 						'---------------------------------------------------------------<br>';
 				} else if (usage && usage.reason === 'token_permission') {
 					kvUsageBars = '---------------------------------------------------------------<br>\n' +
