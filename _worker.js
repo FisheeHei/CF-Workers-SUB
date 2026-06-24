@@ -26,7 +26,7 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-06-24-kv-usage-dashboard";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-06-24-distinct-nginx";
 // UA 轮换池：首轮用默认UA，重试时依次切换
 // LINK.txt 内存缓存：避免每次请求读KV + 用户编辑后 30s 内生效
 const LINK_TEXT_CACHE = { value: null, ts: 0 };
@@ -316,9 +316,6 @@ export default {
 		const ChatID = env.TGID || DEFAULT_CONFIG.chatID;
 		const TG = Number(env.TG ?? DEFAULT_CONFIG.tg);
 		const subConverters = normalizeSubConverters(env.SUBAPI || DEFAULT_SUB_CONVERTER);
-		const cfAccountId = env.CF_ACCOUNT_ID || '';
-		const cfApiToken = env.CF_API_TOKEN || '';
-
 		const subConverterDisplay = subConverters.map(item => `${item.subProtocol}://${item.subConverter}`).join(', ');
 		const subConverterStateBackend = env.KV ? 'KV' : 'MEMORY';
 		const subConfig = env.SUBCONFIG || DEFAULT_SUB_CONFIG;
@@ -369,7 +366,7 @@ export default {
 				await 迁移地址列表(env, 'LINK.txt');
 				if (userAgent.includes('mozilla') && !url.search) {
 					runInBackground(ctx, sendMessage(`#编辑订阅 ${FileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgentHeader}</tg-spoiler>\n域名: ${url.hostname}\n<tg-spoiler>入口: ${url.pathname + url.search}</tg-spoiler>`, { BotToken, ChatID }), DEBUG);
-					return await KV(request, env, 'LINK.txt', 访客订阅, { FileName, mytoken, subConverterDisplay, subConverterStateBackend, subConfig, subRetry, subTimeout, subApiTimeout, subApiStagger, subCache, showFailedSub, cfAccountId, cfApiToken });
+					return await KV(request, env, 'LINK.txt', 访客订阅, { FileName, mytoken, subConverterDisplay, subConverterStateBackend, subConfig, subRetry, subTimeout, subApiTimeout, subApiStagger, subCache, showFailedSub });
 				} else {
 					const now = Date.now();
 				if (now - LINK_TEXT_CACHE.ts > LINK_TEXT_CACHE_TTL) {
@@ -1044,34 +1041,6 @@ async function 迁移地址列表(env, txt = 'ADD.txt') {
 	return false;
 }
 
-async function fetchKvUsage(accountId, apiToken) {
-	if (!accountId || !apiToken) return null;
-	try {
-		const today = new Date();
-		today.setHours(0, 0, 0, 0);
-		const query = JSON.stringify({
-			query: `{viewer{accounts(filter:{accountTag:"${accountId}"}){
-				kvNamespaceAnalyticsAdaptiveGroups(
-					limit:1,
-					filter:{datetime_gt:"${today.toISOString()}"}
-					orderBy:[datetime_DESC]
-				){sum{requests reads writes}}
-			}}}`
-		});
-		const resp = await fetch("https://api.cloudflare.com/client/v4/graphql", {
-			method: "POST",
-			headers: { "Authorization": "Bearer " + apiToken, "Content-Type": "application/json" },
-			body: query,
-		});
-		if (!resp.ok) return null;
-		const data = await resp.json();
-		const groups = data?.data?.viewer?.accounts?.[0]?.kvNamespaceAnalyticsAdaptiveGroups;
-		if (!groups || groups.length === 0) return null;
-		return groups[0].sum || null;
-	} catch (e) { return null; }
-}
-
-
 async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 	const {
 		FileName = DEFAULT_CONFIG.fileName,
@@ -1085,8 +1054,6 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 		subApiStagger = DEFAULT_CONFIG.subApiStagger,
 		subCache = DEFAULT_CONFIG.subCache,
 		showFailedSub = DEFAULT_CONFIG.showFailedSub,
-		cfAccountId = '',
-		cfApiToken = '',
 	} = config;
 	const url = new URL(request.url);
 	try {
@@ -1116,37 +1083,7 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 			}
 		}
 		const stats = summarizeLinks(content);
-		let kvUsageBars = '';
-		if (cfAccountId && cfApiToken) {
-			try {
-				const usage = await fetchKvUsage(cfAccountId, cfApiToken);
-				if (usage) {
-					const reads = usage.reads || 0;
-					const writes = usage.writes || 0;
-					const readPct = Math.min(reads / 100000 * 100, 100);
-					const writePct = Math.min(writes / 1000 * 100, 100);
-					kvUsageBars = '---------------------------------------------------------------<br>
-					KV \u5168\u8d26\u53f7\u914d\u989d\u4f7f\u7528\uff08\u4eca\u65e5\uff09<br>
-					KV Reads: <span style="color:#' + (readPct > 80 ? 'e53e3e' : '666') + '">' + reads.toLocaleString() + '</span> / 100,000<br>
-					<div style="background:#eee;border-radius:4px;height:12px;width:300px;overflow:hidden">
-						<div style="background:' + (readPct > 80 ? '#e53e3e' : '#4CAF50') + ';width:' + readPct + '%;height:12px;border-radius:4px"></div>
-					</div><br>
-					KV Writes: <span style="color:#' + (writePct > 80 ? 'e53e3e' : '666') + '">' + writes.toLocaleString() + '</span> / 1,000<br>
-					<div style="background:#eee;border-radius:4px;height:12px;width:300px;overflow:hidden">
-						<div style="background:' + (writePct > 80 ? '#e53e3e' : '#2196F3') + ';width:' + writePct + '%;height:12px;border-radius:4px"></div>
-					</div><br>
-					---------------------------------------------------------------<br>';
-				} else {
-					kvUsageBars = '---------------------------------------------------------------<br>
-					KV \u914d\u989d\u67e5\u8be2\u5931\u8d25\uff08\u8bf7\u68c0\u67e5 Account ID / API Token\uff09<br>
-					---------------------------------------------------------------<br>';
-				}
-			} catch (e) {
-				kvUsageBars = '---------------------------------------------------------------<br>
-				KV \u67e5\u8be2\u5f02\u5e38<br>
-				---------------------------------------------------------------<br>';
-			}
-		}
+
 		const html = `
 			<!DOCTYPE html>
 			<html>
@@ -1271,7 +1208,6 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 					<!-- SHOW_FAILED_SUB: <strong>${showFailedSub ? '1' : '0'}</strong><br> -->
 					VERSION（部署标记）: <strong>${CUSTOM_FIX_VERSION}</strong><br>
 					---------------------------------------------------------------<br>
-					${kvUsageBars}
 					################################################################<br>
 					${FileName} 汇聚订阅编辑:
 					<br>数据统计: <strong>${stats.total}</strong> 行 / 自建节点 <strong>${stats.local}</strong> / 远程订阅 <strong>${stats.remote}</strong><br>
