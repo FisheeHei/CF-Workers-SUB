@@ -601,7 +601,7 @@ async function nginx() {
 	<p>If you see this page, the nginx web server is successfully installed and working. Further configuration is required.</p>
 	<p class="highlight">Powered by Cloudflare Workers</p>
 	<hr>
-	<p class="footer"><em>Thank you for using nginx.</em> &middot; Custom Edition</p>
+	<p class="footer"><em>Thank you for using nginx.</em><br>Modified by <strong>FisheeHei</strong></p>
 	</body>
 	</html>
 	`;
