@@ -1046,15 +1046,18 @@ async function 迁移地址列表(env, txt = 'ADD.txt') {
 
 
 async function fetchKvUsage(accountId, apiToken) {
-	if (!accountId || !apiToken) return null;
+	if (!accountId || !apiToken) return { ok: false, reason: 'no_credentials' };
 	try {
 		const today = new Date();
-		today.setHours(0, 0, 0, 0);
+		const dayStart = new Date(today);
+		dayStart.setHours(0, 0, 0, 0);
+		const dayEnd = new Date(dayStart);
+		dayEnd.setDate(dayEnd.getDate() + 1);
 		const query = JSON.stringify({
 			query: '{viewer{accounts(filter:{accountTag:"' + accountId + '"}){' +
 				'kvNamespaceAnalyticsAdaptiveGroups(' +
 					'limit:1,' +
-					'filter:{datetime_gt:"' + today.toISOString() + '"}' +
+					'filter:{datetime_geq:"' + dayStart.toISOString() + '",datetime_lt:"' + dayEnd.toISOString() + '"}' +
 					'orderBy:[datetime_DESC]' +
 				'){sum{requests reads writes}}' +
 			'}}}'
@@ -1064,12 +1067,19 @@ async function fetchKvUsage(accountId, apiToken) {
 			headers: { "Authorization": "Bearer " + apiToken, "Content-Type": "application/json" },
 			body: query,
 		});
-		if (!resp.ok) return null;
+		if (!resp.ok) return { ok: false, reason: 'http_' + resp.status };
 		const data = await resp.json();
+		if (data.errors && data.errors.length > 0) {
+			const msg = data.errors[0].message || '';
+			if (msg.includes('permission') || msg.includes('Unauthorized') || msg.includes('authorization') || msg.includes('Authentication'))
+				return { ok: false, reason: 'token_permission' };
+			return { ok: false, reason: 'graphql_error' };
+		}
 		const groups = data?.data?.viewer?.accounts?.[0]?.kvNamespaceAnalyticsAdaptiveGroups;
-		if (!groups || groups.length === 0) return null;
-		return groups[0].sum || null;
-	} catch (e) { return null; }
+		if (!groups || groups.length === 0) return { ok: false, reason: 'no_data' };
+		const sum = groups[0].sum;
+		return { ok: true, reads: sum.reads || 0, writes: sum.writes || 0 };
+	} catch (e) { return { ok: false, reason: 'exception' }; }
 }
 
 async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
@@ -1120,30 +1130,32 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 		if (cfAccountId && cfApiToken) {
 			try {
 				const usage = await fetchKvUsage(cfAccountId, cfApiToken);
-				if (usage) {
+				if (usage && usage.ok) {
 					const reads = usage.reads || 0;
 					const writes = usage.writes || 0;
-					const readPct = Math.min(reads / 100000 * 100, 100);
-					const writePct = Math.min(writes / 1000 * 100, 100);
+					const readPct = (reads / 100000 * 100).toFixed(1);
+					const writePct = (writes / 1000 * 100).toFixed(1);
 					kvUsageBars = '---------------------------------------------------------------<br>\n' +
-						'KV \u5168\u8d26\u53f7\u914d\u989d\u4f7f\u7528\uff08\u4eca\u65e5\uff09<br>\n' +
-						'KV Reads: <span style="color:#' + (readPct > 80 ? 'e53e3e' : '666') + '">' + reads.toLocaleString() + '</span> / 100,000<br>\n' +
-						'<div style="background:#eee;border-radius:4px;height:12px;width:300px;overflow:hidden">\n' +
-						'\t<div style="background:' + (readPct > 80 ? '#e53e3e' : '#4CAF50') + ';width:' + readPct + '%;height:12px;border-radius:4px"></div>\n' +
-						'</div><br>\n' +
-						'KV Writes: <span style="color:#' + (writePct > 80 ? 'e53e3e' : '666') + '">' + writes.toLocaleString() + '</span> / 1,000<br>\n' +
-						'<div style="background:#eee;border-radius:4px;height:12px;width:300px;overflow:hidden">\n' +
-						'\t<div style="background:' + (writePct > 80 ? '#e53e3e' : '#2196F3') + ';width:' + writePct + '%;height:12px;border-radius:4px"></div>\n' +
-						'</div><br>\n' +
+						'KV \u5168\u8d26\u53f7\u914d\u989d\u4f7f\u7528\uff08\u4eca\u65e5 UTC\uff09<br>\n' +
+						'KV Reads: ' + reads.toLocaleString() + ' / 100,000 (' + readPct + '%)<br>\n' +
+						'KV Writes: ' + writes.toLocaleString() + ' / 1,000 (' + writePct + '%)<br>\n' +
+						'---------------------------------------------------------------<br>';
+				} else if (usage && usage.reason === 'token_permission') {
+					kvUsageBars = '---------------------------------------------------------------<br>\n' +
+						'KV \u914d\u989d\u67e5\u8be2\u5931\u8d25: API Token \u6743\u9650\u4e0d\u8db3\uff08\u9700 Account Analytics Read\uff09<br>\n' +
+						'---------------------------------------------------------------<br>';
+				} else if (usage && usage.reason === 'no_data') {
+					kvUsageBars = '---------------------------------------------------------------<br>\n' +
+						'KV \u914d\u989d\u67e5\u8be2\u5931\u8d25: \u6682\u65e0\u4eca\u65e5\u6570\u636e\uff08KV \u5206\u6790\u6709 15-30 \u5206\u949f\u5ef6\u8fdf\uff09<br>\n' +
 						'---------------------------------------------------------------<br>';
 				} else {
 					kvUsageBars = '---------------------------------------------------------------<br>\n' +
-						'KV \u914d\u989d\u67e5\u8be2\u5931\u8d25\uff08\u8bf7\u68c0\u67e5 Account ID / API Token\uff09<br>\n' +
+						'KV \u914d\u989d\u67e5\u8be2\u5931\u8d25\uff08' + (usage ? usage.reason : 'unknown') + '\uff09<br>\n' +
 						'---------------------------------------------------------------<br>';
 				}
 			} catch (e) {
 				kvUsageBars = '---------------------------------------------------------------<br>\n' +
-					'KV \u67e5\u8be2\u5f02\u5e38<br>\n' +
+					'KV \u67e5\u8be2\u5f02\u5e38: ' + (e.message || '') + '<br>\n' +
 					'---------------------------------------------------------------<br>';
 			}
 		}
