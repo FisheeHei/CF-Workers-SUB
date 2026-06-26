@@ -26,7 +26,7 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-06-24-kv-dashboard-v4";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-06-26-kv-dashboard-fixed";
 // UA 轮换池：首轮用默认UA，重试时依次切换
 // LINK.txt 内存缓存：避免每次请求读KV + 用户编辑后 30s 内生效
 const LINK_TEXT_CACHE = { value: null, ts: 0 };
@@ -1048,11 +1048,12 @@ async function 迁移地址列表(env, txt = 'ADD.txt') {
 async function fetchKvUsage(accountId, apiToken) {
 	if (!accountId || !apiToken) return { ok: false, reason: 'no_credentials' };
 	try {
+		// Filter for today's operations (00:00 UTC onwards) and group by actionType to separate reads/writes
+		const now = new Date();
+		const today = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+		const todayISO = today.toISOString();
 		const query = JSON.stringify({
-			query: '{viewer{accounts(filter:{accountTag:"' + accountId + '"}){' +
-				'kvOperationsAdaptiveGroups(limit:1)' +
-				'{sum{requests}}' +
-			'}}}'
+			query: '{viewer{accounts(filter:{accountTag:"' + accountId + '"}){kvOperationsAdaptiveGroups(limit:10,filter:{datetime_geq:"' + todayISO + '"},orderBy:[actionType_ASC]){dimensions{actionType}sum{requests bytes}}}}}'
 		});
 		const resp = await fetch('https://api.cloudflare.com/client/v4/graphql', {
 			method: 'POST',
@@ -1062,15 +1063,23 @@ async function fetchKvUsage(accountId, apiToken) {
 		if (!resp.ok) return { ok: false, reason: 'http_' + resp.status };
 		const data = await resp.json();
 		if (data.errors && data.errors.length > 0) {
-			const msg = data.errors[0].message || data.errors[0].path || '';
-			if (msg.includes('permission') || msg.includes('Unauthorized') || msg.includes('authorization') || msg.includes('Authentication'))
-				return { ok: false, reason: 'token_permission' };
-			return { ok: false, reason: 'graphql_error: ' + msg };
+			return { ok: false, reason: 'graphql_err: ' + data.errors[0].message };
 		}
 		const groups = data?.data?.viewer?.accounts?.[0]?.kvOperationsAdaptiveGroups;
-		if (!groups || groups.length === 0) return { ok: false, reason: 'no_data' };
-		const sum = groups[0].sum;
-		return { ok: true, requests: sum.requests || 0 };
+		if (!groups || groups.length === 0) {
+			return { ok: false, reason: 'no_data' };
+		}
+		let reads = 0, writes = 0, totalBytes = 0;
+		for (const group of groups) {
+			const action = (group.dimensions?.actionType || '').toLowerCase();
+			if (group.sum) {
+				if (action === 'read') reads += group.sum.requests || 0;
+				else if (action === 'write') writes += group.sum.requests || 0;
+				totalBytes += group.sum.bytes || 0;
+			}
+		}
+		const total = reads + writes;
+		return { ok: true, requests: total, reads, writes, totalBytes };
 	} catch (e) { return { ok: false, reason: 'exception' }; }
 }
 
@@ -1145,16 +1154,25 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 				if (usage && usage.ok) {
 					const reads = usage.reads || 0;
 					const writes = usage.writes || 0;
-					const reqPct = (requests / readLimit * 100).toFixed(1);
-					const barLen = Math.round(parseFloat(reqPct) / 10) || 0;
-					const bar = '\u2588'.repeat(barLen) + '\u2591'.repeat(10 - barLen);
-					kvUsageBars = '---------------------------------------------------------------<br>\n' +
+					const total = usage.requests || 0;
+					function buildBar(current, limit) {
+						const pct = limit > 0 ? (current / limit * 100) : 0;
+						const barLen = Math.min(Math.round(pct / 10), 10);
+						const bar = '\u2588'.repeat(barLen) + '\u2591'.repeat(10 - barLen);
+						let color;
+						if (pct < 50) color = '#4CAF50';
+						else if (pct < 80) color = '#FFC107';
+						else color = '#F44336';
+						return { bar, pct: pct.toFixed(1), color };
+					}
+					const rBar = buildBar(reads, readLimit);
+					const wBar = buildBar(writes, writeLimit);
+					kvUsageBars =
+						'---------------------------------------------------------------<br>\n' +
 						'KV \u5168\u8d26\u53f7\u914d\u989d\u4f7f\u7528\uff08\u914d\u989d\u6bcf\u65e5 00:00 UTC \u91cd\u7f6e' + planLabel + '\uff09<br>\n' +
-						'KV Requests: ' + bar + ' ' + requests.toLocaleString() + ' / ' + readLimit.toLocaleString() + ' (' + reqPct + '%)<br>\n' +
-						'---------------------------------------------------------------<br>';
-				} else if (usage && usage.reason === 'token_permission') {
-					kvUsageBars = '---------------------------------------------------------------<br>\n' +
-						'KV \u914d\u989d\u67e5\u8be2\u5931\u8d25: API Token \u6743\u9650\u4e0d\u8db3\uff08\u9700 Account Analytics Read\uff09<br>\n' +
+						'Reads  \u00b7 ' + rBar.bar + ' <span style="color:' + rBar.color + '">' + reads.toLocaleString() + ' / ' + readLimit.toLocaleString() + ' (' + rBar.pct + '%)</span><br>\n' +
+						'Writes \u00b7 ' + wBar.bar + ' <span style="color:' + wBar.color + '">' + writes.toLocaleString() + ' / ' + writeLimit.toLocaleString() + ' (' + wBar.pct + '%)</span><br>\n' +
+						'Total  \u00b7 <span style="color:' + (Number(rBar.pct) > 80 || Number(wBar.pct) > 80 ? '#F44336' : Number(rBar.pct) > 50 || Number(wBar.pct) > 50 ? '#FFC107' : '#4CAF50') + '">' + total.toLocaleString() + ' / ' + (readLimit + writeLimit).toLocaleString() + '</span><br>\n' +
 						'---------------------------------------------------------------<br>';
 				} else if (usage && usage.reason === 'no_data') {
 					kvUsageBars = '---------------------------------------------------------------<br>\n' +
