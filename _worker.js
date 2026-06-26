@@ -359,8 +359,7 @@ export default {
 				}),
 			});
 		} else {
-			// KV converter health persistence disabled per request to reduce KV ops
-		// if (subConverters.length > 0) await loadPersistedSubConverterHealth(env.KV, subConverters, DEBUG);
+		if (subConverters.length > 0) await loadPersistedSubConverterHealth(env.KV, subConverters, DEBUG);
 			let MainData = DEFAULT_MAIN_DATA;
 		let rawLinkContent = MainData;
 			let urls = [];
@@ -762,8 +761,7 @@ async function fetchSubConverterText(converters, buildUrl, headers, options = {}
 		const lastError = error?.errors?.[error.errors.length - 1];
 		throw lastError || error || new Error('所有订阅转换后端均不可用');
 	} finally {
-		// KV converter health persistence disabled - use in-memory only
-		// runInBackground(ctx, persistSubConverterHealth(kv, prioritizedConverters, DEBUG), DEBUG);
+		runInBackground(ctx, persistSubConverterHealth(kv, prioritizedConverters, DEBUG), DEBUG);
 	}
 }
 
