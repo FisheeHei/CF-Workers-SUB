@@ -1053,7 +1053,7 @@ async function fetchKvUsage(accountId, apiToken) {
 		const today = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
 		const todayISO = today.toISOString();
 		const query = JSON.stringify({
-			query: '{viewer{accounts(filter:{accountTag:"' + accountId + '"}){kvOperationsAdaptiveGroups(limit:10,filter:{datetime_geq:"' + todayISO + '"},orderBy:[actionType_ASC]){dimensions{actionType}sum{requests bytes}}}}}'
+			query: '{viewer{accounts(filter:{accountTag:"' + accountId + '"}){kvOperationsAdaptiveGroups(limit:10,filter:{datetime_geq:"' + todayISO + '"},orderBy:[actionType_ASC]){dimensions{actionType}sum{requests}}}}}'
 		});
 		const resp = await fetch('https://api.cloudflare.com/client/v4/graphql', {
 			method: 'POST',
@@ -1069,17 +1069,17 @@ async function fetchKvUsage(accountId, apiToken) {
 		if (!groups || groups.length === 0) {
 			return { ok: false, reason: 'no_data' };
 		}
-		let reads = 0, writes = 0, totalBytes = 0;
+		let reads = 0, writes = 0;
 		for (const group of groups) {
 			const action = (group.dimensions?.actionType || '').toLowerCase();
 			if (group.sum) {
 				if (action === 'read') reads += group.sum.requests || 0;
 				else if (action === 'write') writes += group.sum.requests || 0;
-				totalBytes += group.sum.bytes || 0;
+				
 			}
 		}
 		const total = reads + writes;
-		return { ok: true, requests: total, reads, writes, totalBytes };
+		return { ok: true, requests: total, reads, writes };
 	} catch (e) { return { ok: false, reason: 'exception' }; }
 }
 
