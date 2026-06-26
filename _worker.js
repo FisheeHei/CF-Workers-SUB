@@ -282,6 +282,8 @@ function storeSubscriptionCache(cacheKey, response, subCache, ctx, DEBUG = false
 
 // KV 持久化缓存：订阅结果写入 KV，冷启动后无需重新抓取全量订阅链接
 const SUB_KV_PREFIX = "__sub:";
+// 记录每次 KV 持久化写入的时间戳，用于判断 subCache 是否已过期
+const kvWriteTimestamps = new Map();
 // 订阅失败回退缓存（内存，不写KV）
 const staleCache = new Map(); // key: url, value: {content, expiresAt}
 
@@ -470,9 +472,9 @@ export default {
 				? new Request(`${url.origin}/__sub-cache/${await MD5MD5(cacheSeed)}`, { method: "GET" })
 				: null;
 			const cachedResponse = refreshCache ? null : await getSubscriptionCache(cacheKey, DEBUG);
-			// KV 缓存回退：仅在 SUBCACHE < 300 时使用，避免频繁读写KV
+			// KV 持久化缓存回退：优先从KV读取缓存数据
 			let kvCachedBase64 = null;
-			if (!cachedResponse && env.KV && subCache < 300) {
+			if (!cachedResponse && env.KV) {
 				kvCachedBase64 = await getSubFromKV(env.KV, cacheSeed);
 			}
 			if (cachedResponse) return cachedResponse;
@@ -515,10 +517,17 @@ export default {
 			}
 			} // end if (!base64Data)
 
-			// 写入 KV 持久化缓存（异步，不阻塞响应）
-			// 仅在冷启动时写KV缓存（减少KV写入）
-			if (!kvCachedBase64 && subCache < 300) {
-			putSubToKV(env.KV, cacheSeed, base64Data, subCache, ctx);
+			// 写入 KV 持久化缓存（异步，不阻塞响应）：
+			// 更新原则：内容改变（base64 不同） 或 缓存有效期（subCache）已过
+			let needWrite = !kvCachedBase64 || base64Data !== kvCachedBase64;
+			if (!needWrite) {
+				const lastTs = kvWriteTimestamps.get(cacheSeed) || 0;
+				const elapsed = (Date.now() - lastTs) / 1000;
+				if (elapsed >= subCache) needWrite = true;
+			}
+			if (needWrite) {
+				kvWriteTimestamps.set(cacheSeed, Date.now());
+				putSubToKV(env.KV, cacheSeed, base64Data, subCache, ctx);
 			}
 
 			// 构建响应头对象
