@@ -247,8 +247,6 @@ function runInBackground(ctx, promise, DEBUG = false) {
 function runtimeHeaders(headers = {}, extra = {}) {
 	const result = new Headers(headers);
 	result.set("X-Custom-Fix-Version", CUSTOM_FIX_VERSION);
-	result.set("X-Content-Type-Options", "nosniff");
-	result.set("Referrer-Policy", "no-referrer");
 	for (const [key, value] of Object.entries(extra)) result.set(key, value);
 	return result;
 }
@@ -346,7 +344,7 @@ export default {
 		let expire = Math.floor(timestamp / 1000);
 		const SUBUpdateTime = env.SUBUPTIME || DEFAULT_CONFIG.subUpdateTime;
 
-		if (!([mytoken, fakeToken, 访客订阅].includes(token) || url.pathname == ("/" + mytoken) || url.pathname.startsWith("/" + mytoken + "?") || url.pathname.startsWith("/" + mytoken + "/"))) {
+		if (!([mytoken, fakeToken, 访客订阅].includes(token) || url.pathname == ("/" + mytoken) || url.pathname.includes("/" + mytoken + "?"))) {
 			if (env.ASSETS && url.pathname.includes('.')) {
 				const assetResponse = await env.ASSETS.fetch(request);
 				if (assetResponse.status !== 404) return assetResponse;
@@ -361,7 +359,8 @@ export default {
 				}),
 			});
 		} else {
-			if (subConverters.length > 0) await loadPersistedSubConverterHealth(env.KV, subConverters, DEBUG);
+			// KV converter health persistence disabled per request to reduce KV ops
+		// if (subConverters.length > 0) await loadPersistedSubConverterHealth(env.KV, subConverters, DEBUG);
 			let MainData = DEFAULT_MAIN_DATA;
 		let rawLinkContent = MainData;
 			let urls = [];
@@ -763,7 +762,8 @@ async function fetchSubConverterText(converters, buildUrl, headers, options = {}
 		const lastError = error?.errors?.[error.errors.length - 1];
 		throw lastError || error || new Error('所有订阅转换后端均不可用');
 	} finally {
-		runInBackground(ctx, persistSubConverterHealth(kv, prioritizedConverters, DEBUG), DEBUG);
+		// KV converter health persistence disabled - use in-memory only
+		// runInBackground(ctx, persistSubConverterHealth(kv, prioritizedConverters, DEBUG), DEBUG);
 	}
 }
 
@@ -1045,24 +1045,15 @@ async function 迁移地址列表(env, txt = 'ADD.txt') {
 
 
 
-
-// Simple in-memory TTL cache for KV quota queries to avoid hitting GraphQL on every request
-const KV_USAGE_CACHE_KEY = '__kv_usage_cache_v1__';
-let kvUsageCache = { value: null, ts: 0 };
-const KV_USAGE_CACHE_TTL = 300000; // 5 minutes
 async function fetchKvUsage(accountId, apiToken) {
 	if (!accountId || !apiToken) return { ok: false, reason: 'no_credentials' };
-	// Check TTL cache first
-	const now = Date.now();
-	if (kvUsageCache.value && now - kvUsageCache.ts < KV_USAGE_CACHE_TTL) {
-		if (kvUsageCache.value.accountId === accountId) return kvUsageCache.value.result;
-	}
 	try {
 		// Filter for today's operations (00:00 UTC onwards) and group by actionType to separate reads/writes
+		const now = new Date();
 		const today = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
 		const todayISO = today.toISOString();
 		const query = JSON.stringify({
-			query: '{viewer{accounts(filter:{accountTag:\"' + accountId + '\"}){kvOperationsAdaptiveGroups(limit:10,filter:{datetime_geq:\"' + todayISO + '\"},orderBy:[actionType_ASC]){dimensions{actionType}sum{requests}}}}}'
+			query: '{viewer{accounts(filter:{accountTag:"' + accountId + '"}){kvOperationsAdaptiveGroups(limit:10,filter:{datetime_geq:"' + todayISO + '"},orderBy:[actionType_ASC]){dimensions{actionType}sum{requests}}}}}'
 		});
 		const resp = await fetch('https://api.cloudflare.com/client/v4/graphql', {
 			method: 'POST',
@@ -1084,15 +1075,15 @@ async function fetchKvUsage(accountId, apiToken) {
 			if (group.sum) {
 				if (action === 'read') reads += group.sum.requests || 0;
 				else if (action === 'write') writes += group.sum.requests || 0;
+				
 			}
 		}
 		const total = reads + writes;
-		const result = { ok: true, requests: total, reads, writes };
-		// Cache the result
-		kvUsageCache = { value: { accountId, result }, ts: now };
-		return result;
+		return { ok: true, requests: total, reads, writes };
 	} catch (e) { return { ok: false, reason: 'exception' }; }
-}async function fetchAccountPlan(accountId, apiToken) {
+}
+
+async function fetchAccountPlan(accountId, apiToken) {
 	try {
 		const resp = await fetch('https://api.cloudflare.com/client/v4/accounts/' + accountId + '/subscriptions', {
 			headers: { "Authorization": "Bearer " + apiToken, "Content-Type": "application/json" },
@@ -1206,7 +1197,6 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 				<head>
 					<title>${FileName} 订阅编辑</title>
 					<meta charset="utf-8">
-					<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'">
 					<meta name="viewport" content="width=device-width, initial-scale=1">
 					<style>
 						body {
