@@ -26,7 +26,7 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-06-26-token-strict";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-06-26-security-headers";
 // UA 轮换池：首轮用默认UA，重试时依次切换
 // LINK.txt 内存缓存：避免每次请求读KV + 用户编辑后 30s 内生效
 const LINK_TEXT_CACHE = { value: null, ts: 0 };
@@ -247,6 +247,8 @@ function runInBackground(ctx, promise, DEBUG = false) {
 function runtimeHeaders(headers = {}, extra = {}) {
 	const result = new Headers(headers);
 	result.set("X-Custom-Fix-Version", CUSTOM_FIX_VERSION);
+	result.set("X-Content-Type-Options", "nosniff");
+	result.set("Referrer-Policy", "no-referrer");
 	for (const [key, value] of Object.entries(extra)) result.set(key, value);
 	return result;
 }
@@ -1204,6 +1206,7 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 				<head>
 					<title>${FileName} 订阅编辑</title>
 					<meta charset="utf-8">
+					<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'">
 					<meta name="viewport" content="width=device-width, initial-scale=1">
 					<style>
 						body {
