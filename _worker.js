@@ -1206,7 +1206,7 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 				<head>
 					<title>${FileName} 订阅编辑</title>
 					<meta charset="utf-8">
-					<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'">
+					<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'">
 					<meta name="viewport" content="width=device-width, initial-scale=1">
 					<style>
 						body {
