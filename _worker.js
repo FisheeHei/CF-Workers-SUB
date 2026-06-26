@@ -26,7 +26,7 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-06-26-cache-opt";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-06-26-token-strict";
 // UA 轮换池：首轮用默认UA，重试时依次切换
 // LINK.txt 内存缓存：避免每次请求读KV + 用户编辑后 30s 内生效
 const LINK_TEXT_CACHE = { value: null, ts: 0 };
@@ -346,7 +346,7 @@ export default {
 		let expire = Math.floor(timestamp / 1000);
 		const SUBUpdateTime = env.SUBUPTIME || DEFAULT_CONFIG.subUpdateTime;
 
-		if (!([mytoken, fakeToken, 访客订阅].includes(token) || url.pathname == ("/" + mytoken) || url.pathname.includes("/" + mytoken + "?"))) {
+		if (!([mytoken, fakeToken, 访客订阅].includes(token) || url.pathname == ("/" + mytoken) || url.pathname.startsWith("/" + mytoken + "?") || url.pathname.startsWith("/" + mytoken + "/"))) {
 			if (env.ASSETS && url.pathname.includes('.')) {
 				const assetResponse = await env.ASSETS.fetch(request);
 				if (assetResponse.status !== 404) return assetResponse;
