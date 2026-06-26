@@ -26,7 +26,7 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-06-26-security-headers";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-06-26-cache-warming";
 // UA 轮换池：首轮用默认UA，重试时依次切换
 // LINK.txt 内存缓存：避免每次请求读KV + 用户编辑后 30s 内生效
 const LINK_TEXT_CACHE = { value: null, ts: 0 };
@@ -371,7 +371,7 @@ export default {
 				await 迁移地址列表(env, 'LINK.txt');
 				if (userAgent.includes('mozilla') && !url.search) {
 					runInBackground(ctx, sendMessage(`#编辑订阅 ${FileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgentHeader}</tg-spoiler>\n域名: ${url.hostname}\n<tg-spoiler>入口: ${url.pathname + url.search}</tg-spoiler>`, { BotToken, ChatID }), DEBUG);
-					return await KV(request, env, 'LINK.txt', 访客订阅, { FileName, mytoken, subConverterDisplay, subConverterStateBackend, subConfig, subRetry, subTimeout, subApiTimeout, subApiStagger, subCache, showFailedSub, cfAccountId, cfApiToken });
+					return await KV(request, env, 'LINK.txt', 访客订阅, { ctx, FileName, mytoken, subConverterDisplay, subConverterStateBackend, subConfig, subRetry, subTimeout, subApiTimeout, subApiStagger, subCache, showFailedSub, cfAccountId, cfApiToken });
 				} else {
 					const now = Date.now();
 				if (now - LINK_TEXT_CACHE.ts > LINK_TEXT_CACHE_TTL) {
@@ -1122,7 +1122,8 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 		showFailedSub = DEFAULT_CONFIG.showFailedSub,
 		cfAccountId = '',
 		cfApiToken = '',
-	} = config;
+			ctx = null,
+		DEBUG = false,} = config;
 	const url = new URL(request.url);
 	try {
 		// POST请求处理
@@ -1131,6 +1132,16 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 			try {
 				const content = await request.text();
 				await env.KV.put(txt, content);
+				
+				// 保存后预热缓存：立即在后台触发一次订阅处理，填充各格式缓存
+				if (ctx && mytoken) {
+					const warmingUrl = new URL(request.url);
+					warmingUrl.pathname = '/' + mytoken;
+					warmingUrl.search = '';
+					runInBackground(ctx, fetch(warmingUrl.toString(), {
+						headers: { 'User-Agent': 'CF-Workers-SUB/cache-warmer/1.0' }
+					}).catch(() => {}), DEBUG);
+				}
 				return new Response("保存成功");
 			} catch (error) {
 				console.error('保存KV时发生错误:', error);
