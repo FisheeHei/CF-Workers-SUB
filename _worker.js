@@ -26,7 +26,7 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-07-03-swr-format-kv";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-07-03-large-sub-fix";
 // UA 轮换池：首轮用默认UA，重试时依次切换
 // LINK.txt 内存缓存：避免每次请求读KV + 用户编辑后 30s 内生效
 const LINK_TEXT_CACHE = { value: null, ts: 0 };
@@ -488,9 +488,11 @@ export default {
 				订阅转换URL += "|" + 请求订阅响应内容[1];
 				if (订阅格式 == 'base64' && !isSubConverterRequest && 请求订阅响应内容[1].includes('://')) {
 					try {
-						const { text: subConverterContent, converter: mixedSubConverter } = await fetchSubConverterText(subConverters, converter => buildSubConverterUrl(converter, 'mixed', 请求订阅响应内容[1], subConfig), { 'User-Agent': 'v2rayN/CF-Workers-SUB  (https://github.com/cmliu/CF-Workers-SUB)' }, { DEBUG, subApiTimeout, subApiStagger, kv: env.KV, ctx });
-						if (mixedSubConverter) selectedSubConverter = mixedSubConverter;
-						req_data += '\n' + atob(subConverterContent);
+						for (const sourceChunk of splitSubConverterSources(请求订阅响应内容[1])) {
+							const { text: subConverterContent, converter: mixedSubConverter } = await fetchSubConverterText(subConverters, converter => buildSubConverterUrl(converter, 'mixed', sourceChunk, subConfig), { 'User-Agent': 'v2rayN/CF-Workers-SUB  (https://github.com/cmliu/CF-Workers-SUB)' }, { DEBUG, subApiTimeout, subApiStagger, kv: env.KV, ctx });
+							if (mixedSubConverter) selectedSubConverter = mixedSubConverter;
+							req_data += '\n' + atob(subConverterContent);
+						}
 					} catch (error) {
 						debugLog(DEBUG, '订阅转换请回base64失败，检查订阅转换后端是否正常运行', error);
 					}
@@ -506,7 +508,7 @@ export default {
 				subConfig,
 				rawLinkContent || '',
 			].join('\n---\n'));
-			订阅转换URL = `${订阅转换基础URL}&src=${sourceFingerprint}` + 订阅转换URL.slice(订阅转换基础URL.length);
+			订阅转换URL = `${订阅转换基础URL}&src=${sourceFingerprint}`;
 
 			const cacheSeed = [
 				cacheUrl.toString(),
@@ -567,7 +569,7 @@ export default {
 			responseHeaders["X-Sub-Source-Fingerprint"] = sourceFingerprint;
 			if (selectedSubConverter) responseHeaders["X-Sub-Converter"] = selectedSubConverter;
 			responseHeaders["X-Sub-Converter-Strategy"] = SUB_CONVERTER_STRATEGY;
-			if (subStatus && subStatus.length) responseHeaders["X-Sub-Fetch-Status"] = subStatus.join("; ");
+			if (subStatus && subStatus.length) responseHeaders["X-Sub-Fetch-Status"] = compactSubStatusHeader(subStatus);
 			responseHeaders["X-Sub-Converter-State"] = subConverterStateBackend;
 
 			if (订阅格式 == 'base64' || token == fakeToken) {
@@ -746,6 +748,45 @@ function clashFix(content) {
 function buildSubConverterUrl(converter, target, sourceUrl, subConfig, extraQuery = '') {
 	const extra = extraQuery ? `&${extraQuery}` : '';
 	return `${converter.subProtocol}://${converter.subConverter}/sub?target=${target}${extra}&url=${encodeURIComponent(sourceUrl)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false&new_name=true`;
+}
+
+const SUB_CONVERTER_SOURCE_URL_LIMIT = 6000;
+const SUB_STATUS_HEADER_LIMIT = 3500;
+
+function splitSubConverterSources(sourceUrls, maxLength = SUB_CONVERTER_SOURCE_URL_LIMIT) {
+	const items = String(sourceUrls || '').split('|').map(item => item.trim()).filter(Boolean);
+	const chunks = [];
+	let current = '';
+	for (const item of items) {
+		const next = current ? `${current}|${item}` : item;
+		if (current && encodeURIComponent(next).length > maxLength) {
+			chunks.push(current);
+			current = item;
+		} else {
+			current = next;
+		}
+	}
+	if (current) chunks.push(current);
+	return chunks;
+}
+
+function compactSubStatusHeader(statuses, maxLength = SUB_STATUS_HEADER_LIMIT) {
+	const parts = [];
+	let used = 0;
+	let omitted = 0;
+	for (const status of statuses || []) {
+		const value = String(status || '').trim();
+		if (!value) continue;
+		const extra = (parts.length ? 2 : 0) + value.length;
+		if (used + extra > maxLength) {
+			omitted++;
+			continue;
+		}
+		parts.push(value);
+		used += extra;
+	}
+	if (omitted > 0) parts.push(`... ${omitted} more`);
+	return parts.join("; ");
 }
 
 async function requestSubConverter(converter, buildUrl, headers, options = {}) {
