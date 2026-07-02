@@ -26,7 +26,7 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-06-26-cache-warming";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-07-03-swr-format-kv";
 // UA 轮换池：首轮用默认UA，重试时依次切换
 // LINK.txt 内存缓存：避免每次请求读KV + 用户编辑后 30s 内生效
 const LINK_TEXT_CACHE = { value: null, ts: 0 };
@@ -284,17 +284,31 @@ function storeSubscriptionCache(cacheKey, response, subCache, ctx, DEBUG = false
 
 // KV 持久化缓存：订阅结果写入 KV，冷启动后无需重新抓取全量订阅链接
 const SUB_KV_PREFIX = "__sub:";
-// 记录每次 KV 持久化写入的时间戳，用于判断 subCache 是否已过期
-const kvWriteTimestamps = new Map();
+const SUB_KV_STALE_TTL_MIN = 3600;
+const SUB_KV_STALE_TTL_MAX = 86400;
+const SUB_KV_STALE_TTL_MULTIPLIER = 6;
 // 订阅失败回退缓存（内存，不写KV）
 const staleCache = new Map(); // key: url, value: {content, expiresAt}
 
-async function getSubFromKV(kv, cacheSeed) {
+function getSubKvExpirationTtl(ttl) {
+	return Math.min(SUB_KV_STALE_TTL_MAX, Math.max(SUB_KV_STALE_TTL_MIN, ttl * SUB_KV_STALE_TTL_MULTIPLIER));
+}
+
+async function getSubFromKV(kv, cacheSeed, maxAge = 0) {
 	if (!kv) return null;
 	try {
 		const key = SUB_KV_PREFIX + await MD5MD5(cacheSeed);
 		const cached = await kv.get(key);
-		if (cached) return cached;
+		if (!cached) return null;
+		try {
+			const parsed = JSON.parse(cached);
+			if (parsed && typeof parsed.data === 'string') {
+				const ts = Number(parsed.ts) || 0;
+				const age = ts > 0 ? (Date.now() - ts) / 1000 : 0;
+				return { data: parsed.data, age, stale: !!(maxAge && ts && age >= maxAge), legacy: false };
+			}
+		} catch (e) { /* 兼容旧版纯文本缓存 */ }
+		return { data: cached, age: 0, stale: false, legacy: true };
 	} catch (e) { /* KV 读取失败静默降级 */ }
 	return null;
 }
@@ -304,7 +318,7 @@ function putSubToKV(kv, cacheSeed, data, ttl, ctx) {
 	runInBackground(ctx, (async () => {
 		try {
 			const key = SUB_KV_PREFIX + await MD5MD5(cacheSeed);
-			await kv.put(key, data, { expirationTtl: Math.max(ttl, 60) });
+			await kv.put(key, JSON.stringify({ data, ts: Date.now() }), { expirationTtl: getSubKvExpirationTtl(ttl) });
 		} catch (e) { /* KV 写入失败静默降级 */ }
 	})(), false);
 }
@@ -429,6 +443,41 @@ export default {
 			else if (url.searchParams.has('loon')) 追加UA = 'Loon';
 
 			const 订阅链接数组 = [...new Set(urls)].filter(item => item?.trim?.()); // 去重
+			const cacheUrl = new URL(request.url);
+			cacheUrl.searchParams.delete('refresh');
+			const requestCacheSeed = [
+				cacheUrl.toString(),
+				订阅格式,
+				MainData || '',
+				订阅链接数组.join('\n'),
+				env.WARP || '',
+				subConverterDisplay,
+				subConfig,
+				rawLinkContent || '',
+			].join('\n---\n');
+			const baseResponseHeaders = {
+				"content-type": "text/plain; charset=utf-8",
+				"Profile-Update-Interval": `${SUBUpdateTime}`,
+				"Profile-web-page-url": request.url.includes('?') ? request.url.split('?')[0] : request.url,
+				"X-Sub-Converter-Strategy": SUB_CONVERTER_STRATEGY,
+				"X-Sub-Converter-State": subConverterStateBackend,
+			};
+			const kvCachedFinal = (!refreshCache && env.KV && subCache > 0) ? await getSubFromKV(env.KV, requestCacheSeed, subCache) : null;
+			if (kvCachedFinal) {
+				const headers = runtimeHeaders(baseResponseHeaders, {
+					"X-Sub-Cache": kvCachedFinal.stale ? "KV-STALE" : "KV-HIT",
+					"X-Sub-Cache-Age": `${Math.max(0, Math.floor(kvCachedFinal.age || 0))}`,
+				});
+				if (订阅格式 != 'base64' && !userAgent.includes('mozilla')) headers.set("Content-Disposition", `attachment; filename*=utf-8''${encodeURIComponent(FileName)}`);
+				if (kvCachedFinal.stale) {
+					const refreshUrl = new URL(request.url);
+					refreshUrl.searchParams.set('refresh', '1');
+					runInBackground(ctx, fetch(refreshUrl.toString(), {
+						headers: { 'User-Agent': userAgentHeader || 'CF-Workers-SUB/cache-refresh/1.0' }
+					}), DEBUG);
+				}
+				return new Response(kvCachedFinal.data, { headers });
+			}
 			let selectedSubConverter = '';
 			let subStatus = [];
 			if (订阅链接数组.length > 0) {
@@ -459,8 +508,6 @@ export default {
 			].join('\n---\n'));
 			订阅转换URL = `${订阅转换基础URL}&src=${sourceFingerprint}` + 订阅转换URL.slice(订阅转换基础URL.length);
 
-			const cacheUrl = new URL(request.url);
-			cacheUrl.searchParams.delete('refresh');
 			const cacheSeed = [
 				cacheUrl.toString(),
 				订阅格式,
@@ -474,11 +521,6 @@ export default {
 				? new Request(`${url.origin}/__sub-cache/${await MD5MD5(cacheSeed)}`, { method: "GET" })
 				: null;
 			const cachedResponse = refreshCache ? null : await getSubscriptionCache(cacheKey, DEBUG);
-			// KV 持久化缓存回退：优先从KV读取缓存数据
-			let kvCachedBase64 = null;
-			if (!cachedResponse && env.KV) {
-				kvCachedBase64 = await getSubFromKV(env.KV, cacheSeed);
-			}
 			if (cachedResponse) return cachedResponse;
 			//修复中文错误
 			const utf8Encoder = new TextEncoder();
@@ -490,8 +532,7 @@ export default {
 			//去重
 			const uniqueLines = new Set(text.split('\n'));
 			const result = [...uniqueLines].join('\n');
-			let base64Data = kvCachedBase64 || null;
-			if (!base64Data) {
+			let base64Data = null;
 			try {
 				base64Data = btoa(result);
 			} catch (e) {
@@ -517,26 +558,10 @@ export default {
 
 				base64Data = encodeBase64(result)
 			}
-			} // end if (!base64Data)
-
-			// 写入 KV 持久化缓存（异步，不阻塞响应）：
-			// 更新原则：内容改变（base64 不同） 或 缓存有效期（subCache）已过
-			let needWrite = !kvCachedBase64 || base64Data !== kvCachedBase64;
-			if (!needWrite) {
-				const lastTs = kvWriteTimestamps.get(cacheSeed) || 0;
-				const elapsed = (Date.now() - lastTs) / 1000;
-				if (elapsed >= subCache) needWrite = true;
-			}
-			if (needWrite) {
-				kvWriteTimestamps.set(cacheSeed, Date.now());
-				putSubToKV(env.KV, cacheSeed, base64Data, subCache, ctx);
-			}
 
 			// 构建响应头对象
 			const responseHeaders = {
-				"content-type": "text/plain; charset=utf-8",
-				"Profile-Update-Interval": `${SUBUpdateTime}`,
-				"Profile-web-page-url": request.url.includes('?') ? request.url.split('?')[0] : request.url,
+				...baseResponseHeaders,
 				//"Subscription-Userinfo": `upload=${UD}; download=${UD}; total=${total}; expire=${expire}`,
 			};
 			responseHeaders["X-Sub-Source-Fingerprint"] = sourceFingerprint;
@@ -547,6 +572,7 @@ export default {
 
 			if (订阅格式 == 'base64' || token == fakeToken) {
 				const response = new Response(base64Data, { headers: runtimeHeaders(responseHeaders) });
+				putSubToKV(env.KV, requestCacheSeed, base64Data, subCache, ctx);
 				return storeSubscriptionCache(cacheKey, response, subCache, ctx, DEBUG, refreshCache ? "REFRESH" : "MISS");
 			} else if (订阅格式 == 'clash') {
 				subConverterUrl = converter => buildSubConverterUrl(converter, 'clash', 订阅转换URL, subConfig);
@@ -569,6 +595,7 @@ export default {
 				const headers = runtimeHeaders(responseHeaders);
 				if (!userAgent.includes('mozilla')) headers.set("Content-Disposition", `attachment; filename*=utf-8''${encodeURIComponent(FileName)}`);
 				const response = new Response(subConverterContent, { headers });
+				putSubToKV(env.KV, requestCacheSeed, subConverterContent, subCache, ctx);
 				return storeSubscriptionCache(cacheKey, response, subCache, ctx, DEBUG, refreshCache ? "REFRESH" : "MISS");
 			} catch (error) {
 				return new Response(base64Data, { headers: runtimeHeaders(responseHeaders, { "X-Sub-Cache": "BYPASS" }) });
@@ -1122,8 +1149,9 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 		showFailedSub = DEFAULT_CONFIG.showFailedSub,
 		cfAccountId = '',
 		cfApiToken = '',
-			ctx = null,
-		DEBUG = false,} = config;
+		ctx = null,
+		DEBUG = false,
+	} = config;
 	const url = new URL(request.url);
 	try {
 		// POST请求处理
@@ -1133,14 +1161,16 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 				const content = await request.text();
 				await env.KV.put(txt, content);
 				
-				// 保存后预热缓存：立即在后台触发一次订阅处理，填充各格式缓存
+				// 保存后预热缓存：立即在后台触发常用订阅格式处理，填充多格式 KV 缓存
 				if (ctx && mytoken) {
-					const warmingUrl = new URL(request.url);
-					warmingUrl.pathname = '/' + mytoken;
-					warmingUrl.search = '';
-					runInBackground(ctx, fetch(warmingUrl.toString(), {
-						headers: { 'User-Agent': 'CF-Workers-SUB/cache-warmer/1.0' }
-					}).catch(() => {}), DEBUG);
+					for (const warmingSearch of ['', '?clash', '?singbox']) {
+						const warmingUrl = new URL(request.url);
+						warmingUrl.pathname = '/' + mytoken;
+						warmingUrl.search = warmingSearch;
+						runInBackground(ctx, fetch(warmingUrl.toString(), {
+							headers: { 'User-Agent': 'CF-Workers-SUB/cache-warmer/1.0' }
+						}).catch(() => {}), DEBUG);
+					}
 				}
 				return new Response("保存成功");
 			} catch (error) {
