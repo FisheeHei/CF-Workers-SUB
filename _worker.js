@@ -26,7 +26,7 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-07-03-large-sub-fix-v2";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-07-03-full-source-cache";
 // UA 轮换池：首轮用默认UA，重试时依次切换
 // LINK.txt 内存缓存：避免每次请求读KV + 用户编辑后 30s 内生效
 const LINK_TEXT_CACHE = { value: null, ts: 0 };
@@ -258,7 +258,7 @@ async function getSubscriptionCache(cacheKey, DEBUG = false) {
 	const cached = await caches.default.match(cacheKey);
 	if (!cached) return null;
 	debugLog(DEBUG, `订阅缓存命中: ${cacheKey.url}`);
-	const headers = runtimeHeaders(cached.headers, { "X-Sub-Cache": "HIT" });
+	const headers = runtimeHeaders(cached.headers, { "Cache-Control": "no-cache", "X-Sub-Cache": "HIT" });
 	return new Response(cached.body, { status: cached.status, statusText: cached.statusText, headers });
 }
 
@@ -274,10 +274,14 @@ function storeSubscriptionCache(cacheKey, response, subCache, ctx, DEBUG = false
 		headers: cacheHeaders,
 	});
 	runInBackground(ctx, caches.default.put(cacheKey, cacheableResponse.clone()), DEBUG);
+	const clientHeaders = runtimeHeaders(response.headers, {
+		"Cache-Control": "no-cache",
+		"X-Sub-Cache": cacheState,
+	});
 	return new Response(response.body, {
 		status: response.status,
 		statusText: response.statusText,
-		headers: cacheHeaders,
+		headers: clientHeaders,
 	});
 }
 
@@ -287,8 +291,10 @@ const SUB_KV_PREFIX = "__sub:";
 const SUB_KV_STALE_TTL_MIN = 3600;
 const SUB_KV_STALE_TTL_MAX = 86400;
 const SUB_KV_STALE_TTL_MULTIPLIER = 6;
+const PREPARED_SUB_PREFIX = "__subsrc:";
 // 订阅失败回退缓存（内存，不写KV）
 const staleCache = new Map(); // key: url, value: {content, expiresAt}
+const preparedSubSources = new Map(); // key: fingerprint, value: {data, expiresAt}
 
 function getSubKvExpirationTtl(ttl) {
 	return Math.min(SUB_KV_STALE_TTL_MAX, Math.max(SUB_KV_STALE_TTL_MIN, ttl * SUB_KV_STALE_TTL_MULTIPLIER));
@@ -321,6 +327,23 @@ function putSubToKV(kv, cacheSeed, data, ttl, ctx) {
 			await kv.put(key, JSON.stringify({ data, ts: Date.now() }), { expirationTtl: getSubKvExpirationTtl(ttl) });
 		} catch (e) { /* KV 写入失败静默降级 */ }
 	})(), false);
+}
+
+async function getPreparedSubSource(kv, fingerprint) {
+	if (!/^[a-f0-9]{32}$/i.test(String(fingerprint || ''))) return null;
+	const cached = preparedSubSources.get(fingerprint);
+	if (cached && cached.expiresAt > Date.now()) return cached.data;
+	if (cached) preparedSubSources.delete(fingerprint);
+	if (!kv) return null;
+	try { return await kv.get(PREPARED_SUB_PREFIX + fingerprint); } catch (e) { return null; }
+}
+
+async function putPreparedSubSource(kv, fingerprint, data, ttl) {
+	if (!/^[a-f0-9]{32}$/i.test(String(fingerprint || '')) || !data) return;
+	const expirationTtl = getSubKvExpirationTtl(ttl || DEFAULT_CONFIG.subCache);
+	preparedSubSources.set(fingerprint, { data, expiresAt: Date.now() + expirationTtl * 1000 });
+	if (!kv || !ttl) return;
+	try { await kv.put(PREPARED_SUB_PREFIX + fingerprint, data, { expirationTtl }); } catch (e) {}
 }
 export default {
 	async fetch(request, env, ctx) {
@@ -377,6 +400,12 @@ export default {
 				}),
 			});
 		} else {
+			const preparedSource = token == fakeToken ? await getPreparedSubSource(env.KV, url.searchParams.get('src')) : null;
+			if (preparedSource) {
+				return new Response(preparedSource, {
+					headers: runtimeHeaders({ "content-type": "text/plain; charset=utf-8" }, { "X-Sub-Cache": "PREPARED" }),
+				});
+			}
 		if (subConverters.length > 0) await loadPersistedSubConverterHealth(env.KV, subConverters, DEBUG);
 			let MainData = DEFAULT_MAIN_DATA;
 		let rawLinkContent = MainData;
@@ -465,6 +494,7 @@ export default {
 			const kvCachedFinal = (!refreshCache && env.KV && subCache > 0) ? await getSubFromKV(env.KV, requestCacheSeed, subCache) : null;
 			if (kvCachedFinal) {
 				const headers = runtimeHeaders(baseResponseHeaders, {
+					"Cache-Control": "no-cache",
 					"X-Sub-Cache": kvCachedFinal.stale ? "KV-STALE" : "KV-HIT",
 					"X-Sub-Cache-Age": `${Math.max(0, Math.floor(kvCachedFinal.age || 0))}`,
 				});
@@ -486,12 +516,12 @@ export default {
 				subStatus = 请求订阅响应内容[2] || [];
 				req_data += 请求订阅响应内容[0].join('\n');
 				订阅转换URL += "|" + 请求订阅响应内容[1];
-				if (订阅格式 == 'base64' && !isSubConverterRequest && 请求订阅响应内容[1].includes('://')) {
+				if (!isSubConverterRequest && 请求订阅响应内容[1].includes('://')) {
 					try {
 						for (const sourceChunk of splitSubConverterSources(请求订阅响应内容[1])) {
 							const { text: subConverterContent, converter: mixedSubConverter } = await fetchSubConverterText(subConverters, converter => buildSubConverterUrl(converter, 'mixed', sourceChunk, subConfig), { 'User-Agent': 'v2rayN/CF-Workers-SUB  (https://github.com/cmliu/CF-Workers-SUB)' }, { DEBUG, subApiTimeout, subApiStagger, kv: env.KV, ctx });
 							if (mixedSubConverter) selectedSubConverter = mixedSubConverter;
-							req_data += '\n' + atob(subConverterContent);
+							req_data += '\n' + (tryDecodeBase64(subConverterContent) || subConverterContent);
 						}
 					} catch (error) {
 						debugLog(DEBUG, '订阅转换请回base64失败，检查订阅转换后端是否正常运行', error);
@@ -499,7 +529,7 @@ export default {
 				}
 			}
 
-			if (env.WARP) 订阅转换URL += "|" + (await ADD(env.WARP)).join("|");
+			if (env.WARP) req_data += '\n' + (await ADD(env.WARP)).join("\n");
 			const sourceFingerprint = await MD5MD5([
 				req_data,
 				订阅转换URL,
@@ -560,6 +590,7 @@ export default {
 
 				base64Data = encodeBase64(result)
 			}
+			if (订阅格式 != 'base64' && token != fakeToken) await putPreparedSubSource(env.KV, sourceFingerprint, base64Data, subCache);
 
 			// 构建响应头对象
 			const responseHeaders = {
