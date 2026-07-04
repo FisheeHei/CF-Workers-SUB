@@ -26,7 +26,7 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-07-03-kv-dashboard-env-alias";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-07-04-kv-dashboard-query-rollback";
 // UA 轮换池：首轮用默认UA，重试时依次切换
 // LINK.txt 内存缓存：避免每次请求读KV + 用户编辑后 30s 内生效
 const LINK_TEXT_CACHE = { value: null, ts: 0 };
@@ -367,8 +367,8 @@ export default {
 		const subApiStagger = normalizeNumber(env.SUBAPISTAGGER, DEFAULT_CONFIG.subApiStagger, 0, 3000);
 		const subCache = normalizeNumber(env.SUBCACHE, DEFAULT_CONFIG.subCache, 0, 3600);
 		const showFailedSub = normalizeBoolean(env.SHOW_FAILED_SUB, DEFAULT_CONFIG.showFailedSub);
-		const cfAccountId = env.CF_ACCOUNT_ID || env.ACCOUNT_ID || env.ACCOUNTID || '';
-		const cfApiToken = env.CF_API_TOKEN || env.API_TOKEN || env.APITOKEN || '';
+		const cfAccountId = env.CF_ACCOUNT_ID || '';
+		const cfApiToken = env.CF_API_TOKEN || '';
 		const refreshCache = url.searchParams.has('refresh');
 
 		const currentDate = new Date();
@@ -1310,10 +1310,6 @@ async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
 					'KV \u67e5\u8be2\u5f02\u5e38: ' + (e.message || '') + '<br>\n' +
 					'---------------------------------------------------------------<br>';
 			}
-		} else {
-			kvUsageBars = '---------------------------------------------------------------<br>\n' +
-				'KV \u914d\u989d\u4eea\u8868\u76d8\u672a\u542f\u7528: \u8bf7\u914d\u7f6e CF_ACCOUNT_ID/CF_API_TOKEN\uff08\u6216 ACCOUNTID/APITOKEN\uff09<br>\n' +
-				'---------------------------------------------------------------<br>';
 		}
 
 
