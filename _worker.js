@@ -26,7 +26,7 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-07-08-p0-client-fetch-fix";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-07-09-p0-client-fetch-fix-v2";
 // UA 轮换池：首轮用默认UA，重试时依次切换
 // LINK.txt 内存缓存：避免每次请求读KV + 用户编辑后 30s 内生效
 const LINK_TEXT_CACHE = { value: null, ts: 0 };
@@ -918,6 +918,7 @@ async function proxyURL(proxyURL, url, DEBUG = false) {
 // 熔断机制: 连续失败超过阈值的订阅链接暂时跳过
 const circuitBreaker = new Map(); // key: url, value: {failures, cooldownUntil}
 const CIRCUIT_COOLDOWN_MS = 60000; // 1分钟冷却期 ponytail: 订阅波动基本1min内恢复
+const CIRCUIT_FAILURE_THRESHOLD = 2;
 const FETCH_CONCURRENCY = 8; // 每批并发数
 
 async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
@@ -962,7 +963,7 @@ async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
 				// 熔断: 记录失败次数
 				const cb = circuitBreaker.get(apiUrl) || { failures: 0, cooldownUntil: 0 };
 				cb.failures++;
-				if (cb.failures > subRetry) {
+				if (cb.failures >= Math.max(CIRCUIT_FAILURE_THRESHOLD, subRetry + 1)) {
 					cb.cooldownUntil = Date.now() + CIRCUIT_COOLDOWN_MS;
 				}
 				circuitBreaker.set(apiUrl, cb);
@@ -1018,7 +1019,7 @@ async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
 		// 成功抓取的内容存入内存 stale cache（不写KV）
 		for (const response of modifiedResponses) {
 			if (response.value) {
-				const staleContent = String(response.value || '').slice(0, 65536);
+				const staleContent = String(response.value || '');
 				staleCache.set(response.apiUrl, { content: staleContent, expiresAt: Date.now() + 86400000 });
 			}
 		}
@@ -1039,11 +1040,15 @@ async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
 						const decoded = tryDecodeBase64(proxyContent);
 						if (decoded) {
 							newapi += decoded + '\n';
+							failed.status = 'fulfilled';
+							failed.value = decoded;
 							subStatus[subStatus.findIndex(s => s.startsWith(failed.apiUrl))] = failed.apiUrl + ' SUBAPI_OK';
 							fallbackOk = true;
 							break;
 						} else if (/^[a-z]+:\/\//im.test(proxyContent)) {
 							newapi += proxyContent + '\n';
+							failed.status = 'fulfilled';
+							failed.value = proxyContent;
 							subStatus[subStatus.findIndex(s => s.startsWith(failed.apiUrl))] = failed.apiUrl + ' SUBAPI_OK';
 							fallbackOk = true;
 							break;
