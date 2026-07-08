@@ -26,7 +26,7 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-07-04-kv-dashboard-query-rollback";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-07-08-p0-client-fetch-fix";
 // UA 轮换池：首轮用默认UA，重试时依次切换
 // LINK.txt 内存缓存：避免每次请求读KV + 用户编辑后 30s 内生效
 const LINK_TEXT_CACHE = { value: null, ts: 0 };
@@ -917,7 +917,7 @@ async function proxyURL(proxyURL, url, DEBUG = false) {
 
 // 熔断机制: 连续失败超过阈值的订阅链接暂时跳过
 const circuitBreaker = new Map(); // key: url, value: {failures, cooldownUntil}
-const CIRCUIT_COOLDOWN_MS = 300000; // 5分钟冷却期
+const CIRCUIT_COOLDOWN_MS = 60000; // 1分钟冷却期 ponytail: 订阅波动基本1min内恢复
 const FETCH_CONCURRENCY = 8; // 每批并发数
 
 async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
@@ -1017,7 +1017,7 @@ async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
 		}
 		// 成功抓取的内容存入内存 stale cache（不写KV）
 		for (const response of modifiedResponses) {
-			if (response.status === 'fulfilled' && response.value) {
+			if (response.value) {
 				const staleContent = String(response.value || '').slice(0, 65536);
 				staleCache.set(response.apiUrl, { content: staleContent, expiresAt: Date.now() + 86400000 });
 			}
@@ -1026,28 +1026,33 @@ async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
 		if (subConverters && subConverters.length > 0) {
 			const failedUrls = modifiedResponses.filter(r => r.status !== 'fulfilled');
 			for (const failed of failedUrls) {
-				const converter = subConverters[0]; // 选第一个可用的 SUBAPI
-				const proxyUrl = `${converter.subProtocol}://${converter.subConverter}/sub?target=auto&url=${encodeURIComponent(failed.apiUrl)}&insert=false`;
-				try {
-					const controller = new AbortController();
-					const timer = setTimeout(() => controller.abort(), subTimeout);
-					const proxyResp = await fetch(proxyUrl, { headers: { 'User-Agent': userAgentHeader || `v2rayN/CF-Workers-SUB` }, signal: controller.signal });
-					clearTimeout(timer);
-					if (!proxyResp.ok) throw new Error(`SUBAPI HTTP ${proxyResp.status}`);
-					const proxyContent = await proxyResp.text();
-					const decoded = tryDecodeBase64(proxyContent);
-					if (decoded) {
-						newapi += decoded + '\n';
-						subStatus[subStatus.findIndex(s => s.startsWith(failed.apiUrl))] = failed.apiUrl + ' SUBAPI_OK';
-					} else if (/^[a-z]+:\/\//im.test(proxyContent)) {
-						newapi += proxyContent + '\n';
-						subStatus[subStatus.findIndex(s => s.startsWith(failed.apiUrl))] = failed.apiUrl + ' SUBAPI_OK';
-					} else {
-						subStatus[subStatus.findIndex(s => s.startsWith(failed.apiUrl))] = failed.apiUrl + ' SUBAPI_FAIL';
+				let fallbackOk = false;
+				for (const converter of subConverters || []) {
+					const proxyUrl = \:///sub?target=auto&url=&insert=false;
+					try {
+						const controller = new AbortController();
+						const timer = setTimeout(() => controller.abort(), subTimeout);
+						const proxyResp = await fetch(proxyUrl, { headers: { 'User-Agent': userAgentHeader || 2rayN/CF-Workers-SUB }, signal: controller.signal });
+						clearTimeout(timer);
+						if (!proxyResp.ok) continue;
+						const proxyContent = await proxyResp.text();
+						const decoded = tryDecodeBase64(proxyContent);
+						if (decoded) {
+							newapi += decoded + '\n';
+							subStatus[subStatus.findIndex(s => s.startsWith(failed.apiUrl))] = failed.apiUrl + ' SUBAPI_OK';
+							fallbackOk = true;
+							break;
+						} else if (/^[a-z]+:\/\//im.test(proxyContent)) {
+							newapi += proxyContent + '\n';
+							subStatus[subStatus.findIndex(s => s.startsWith(failed.apiUrl))] = failed.apiUrl + ' SUBAPI_OK';
+							fallbackOk = true;
+							break;
+						}
+					} catch (e) {
+						debugLog(DEBUG, SUBAPI fallback failed for  via ://:, e.message || e);
 					}
-				} catch (e) {
-					debugLog(DEBUG, `SUBAPI fallback failed for ${failed.apiUrl}:`, e.message || e);
 				}
+				if (!fallbackOk) subStatus[subStatus.findIndex(s => s.startsWith(failed.apiUrl))] = failed.apiUrl + ' SUBAPI_FAIL';
 			}
 		}
 		// SUBAPI 也失败的订阅：尝试从内存 stale cache 恢复
