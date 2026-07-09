@@ -26,7 +26,7 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-07-09-full-source-cache-client-fetch-fix";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-07-09-full-source-cache-client-fetch-fix-v2";
 // UA 轮换池：首轮用默认UA，重试时依次切换
 // LINK.txt 内存缓存：避免每次请求读KV + 用户编辑后 30s 内生效
 const LINK_TEXT_CACHE = { value: null, ts: 0 };
@@ -511,20 +511,20 @@ export default {
 			let selectedSubConverter = '';
 			let subStatus = [];
 			if (订阅链接数组.length > 0) {
-				const 请求订阅响应内容 = await getSUB(订阅链接数组, 追加UA, userAgentHeader, { DEBUG, subRetry, subTimeout, showFailedSub, subConverters, kv: env.KV, ctx });
+				const 请求订阅响应内容 = await getSUB(订阅链接数组, 追加UA, userAgentHeader, { DEBUG, subRetry, subTimeout, showFailedSub, subConverters, kv: env.KV, ctx, preparedSourceBase: 订阅转换基础URL, subCache });
 				debugLog(DEBUG, 请求订阅响应内容);
 				subStatus = 请求订阅响应内容[2] || [];
 				req_data += 请求订阅响应内容[0].join('\n');
 				订阅转换URL += "|" + 请求订阅响应内容[1];
 				if (!isSubConverterRequest && 请求订阅响应内容[1].includes('://')) {
-					try {
-						for (const sourceChunk of splitSubConverterSources(请求订阅响应内容[1])) {
+					for (const sourceChunk of splitSubConverterSources(请求订阅响应内容[1])) {
+						try {
 							const { text: subConverterContent, converter: mixedSubConverter } = await fetchSubConverterText(subConverters, converter => buildSubConverterUrl(converter, 'mixed', sourceChunk, subConfig), { 'User-Agent': 'v2rayN/CF-Workers-SUB  (https://github.com/cmliu/CF-Workers-SUB)' }, { DEBUG, subApiTimeout, subApiStagger, kv: env.KV, ctx });
 							if (mixedSubConverter) selectedSubConverter = mixedSubConverter;
 							req_data += '\n' + (tryDecodeBase64(subConverterContent) || subConverterContent);
+						} catch (error) {
+							debugLog(DEBUG, '订阅转换请回base64失败，检查订阅转换后端是否正常运行', error);
 						}
-					} catch (error) {
-						debugLog(DEBUG, '订阅转换请回base64失败，检查订阅转换后端是否正常运行', error);
 					}
 				}
 			}
@@ -922,7 +922,7 @@ const CIRCUIT_FAILURE_THRESHOLD = 2;
 const FETCH_CONCURRENCY = 8; // 每批并发数
 
 async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
-	const { DEBUG = false, subRetry = DEFAULT_CONFIG.subRetry, subTimeout = DEFAULT_CONFIG.subTimeout, showFailedSub = DEFAULT_CONFIG.showFailedSub, subConverters = null, kv = null, ctx = null } = options;
+	const { DEBUG = false, subRetry = DEFAULT_CONFIG.subRetry, subTimeout = DEFAULT_CONFIG.subTimeout, showFailedSub = DEFAULT_CONFIG.showFailedSub, subConverters = null, kv = null, ctx = null, preparedSourceBase = '', subCache = DEFAULT_CONFIG.subCache } = options;
 	if (!api || api.length === 0) {
 		return [];
 	} else api = [...new Set(api)]; // 去重
@@ -987,10 +987,14 @@ async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
 			if (response.status === 'fulfilled') {
 				subStatus.push(response.apiUrl + " OK");
 				const content = await response.value || 'null'; // 获取响应的内容
-				if (content.includes('proxies:')) {
-					订阅转换URLs += "|" + response.apiUrl; // Clash 配置
-				} else if (content.includes('outbounds"') && content.includes('inbounds"')) {
-					订阅转换URLs += "|" + response.apiUrl; // Singbox 配置
+				if (content.includes('proxies:') || (content.includes('outbounds"') && content.includes('inbounds"'))) {
+					if (kv && preparedSourceBase) {
+						const sourceFingerprint = await MD5MD5(response.apiUrl + '\n---\n' + content);
+						await putPreparedSubSource(kv, sourceFingerprint, content, subCache);
+						订阅转换URLs += `|${preparedSourceBase}&src=${sourceFingerprint}`; // Clash/Singbox 配置
+					} else {
+						订阅转换URLs += "|" + response.apiUrl; // Clash/Singbox 配置
+					}
 				} else if (content.includes('://')) {
 					newapi += content + '\n'; // 追加内容
 				} else {
