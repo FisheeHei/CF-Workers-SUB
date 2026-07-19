@@ -24,7 +24,7 @@
 
 > 本版本基于 [cmliu/CF-Workers-SUB](https://github.com/cmliu/CF-Workers-SUB) 修改，以下为相对于原版的新增/改进功能。
 
-### 📊 KV 配额仪表盘
+### 📊 KV 配额仪表盘 （在某一个版本干废了当日KV限额后心有余悸之作）
 
 在订阅编辑页面底部添加了当前 Cloudflare 账号的 KV 读写量仪表盘，以纯字符形式（█ 进度条 + 百分比 + 实际数值）展示：
 
