@@ -19,6 +19,68 @@
 4. **专属代理分流规则：** 自定义分流规则，实现个性化的分流模式；
 5. **更多功能等待发掘...**
 
+
+## 🛠 custom-fix 版本改动说明
+
+> 本版本基于 [cmliu/CF-Workers-SUB](https://github.com/cmliu/CF-Workers-SUB) 修改，以下为相对于原版的新增/改进功能。
+
+### 📊 KV 配额仪表盘
+
+在订阅编辑页面底部添加了当前 Cloudflare 账号的 KV 读写量仪表盘，以纯字符形式（█ 进度条 + 百分比 + 实际数值）展示：
+
+![KV 仪表盘预览](./kvdashboardpreview.png)
+
+- **读取量（Reads）**：当日 KV 读取操作次数与配额对比
+- **写入量（Writes）**：当日 KV 写入操作次数与配额对比
+- **总计（Total）**：读写操作总和
+- **变色指示**：使用量 < 50% 绿色 · 50%~80% 黄色 · > 80% 红色
+- **配额重置**：每日 00:00 UTC 自动重置
+- **计划识别**：自动读取付费计划，区分 Free（10万读/1千写）与 Paid（1000万读/100万写）的配额限制
+
+> **注意**：KV 分析数据有 15~30 分钟延迟，刚部署时可能暂无数据显示。
+
+#### 环境变量
+
+| 变量名 | 说明 |
+|--------|------|
+| `CF_ACCOUNT_ID` | Cloudflare 账号 ID（在仪表盘 URL 中可获取） |
+| `CF_API_TOKEN` | Cloudflare API Token（需 `Account Analytics Read` + `Account Subscriptions Read` 权限） |
+
+两个变量均默认为空，仪表盘不会自动启用。在 Cloudflare Pages 的 `环境变量` 设置中填写即可生效。
+
+---
+
+### 🚀 其他改进
+
+#### 多订阅转换后端（SUBAPI 多后端）
+
+`SUBAPI` 现在支持同时配置多个订阅转换后端，用英文逗号或换行分隔。系统会**自动检测各后端的健康度**（延迟、成功/失败次数、连续失败数），优先选择更健康的节点，避免单点故障。绑定 KV 后健康状态会持久化，Worker 重启后依然有效。
+
+```
+SUBAPI=SUBAPI.cmliussss.net,sub.id9.cc,sub.v1.mk
+```
+
+#### 订阅抓取增强
+
+- **UA 轮换**：订阅链接首次抓取使用默认 UA，失败后自动轮换备用 User-Agent，提高抓取成功率
+- **SUBAPI 代理回退**：直连失败的订阅链接自动通过 SUBAPI 代为抓取，进一步提高可用性
+- **内存 Stale Cache**：成功抓取的内容会保留 24 小时内存缓存，即使 SUBAPI 也失败时仍可恢复数据
+- **可配置超时与重试**：`SUBRETRY`（重试次数）、`SUBTIMEOUT`（抓取超时）、`SUBAPITIMEOUT`（转换超时）、`SUBAPISTAGGER`（多后端并发间隔）
+
+#### 新增环境变量
+
+| 变量名 | 说明 |
+|--------|------|
+| `LINKSUB` | 外部订阅链接，可单独通过变量添加订阅，不与 KV 编辑器冲突 |
+| `WARP` | WARP 节点注入，自动将 WARP 节点合并到订阅结果中 |
+| `SUBCONFIG` | 自定义 Clash/Sing-box 订阅转换配置文件，覆盖默认的 ACL4SSR 规则 |
+| `SUBCACHE` | 订阅结果缓存时间（秒），设为 0 关闭，范围 0-3600 |
+| `SHOW_FAILED_SUB` | 是否在结果中显示异常的订阅占位节点 |
+
+#### 迁移兼容
+
+自动将旧版 KV 中路径带 `/` 前缀的键迁移到无前缀格式（`/LINK.txt` → `LINK.txt`），确保升级后数据不丢失。
+
 ## 🎬 视频教程
 - **[自建订阅！CF-Workers-SUB 教你如何将多节点多订阅汇聚合并为一个订阅！](https://youtu.be/w6rRY4FDd58)**
 
@@ -105,8 +167,16 @@
 | TGTOKEN | `6894123456:XXXXXXXXXX0qExVsBPUhHDAbXXXXXqWXgBA` | ❌ | 发送TG通知的机器人token | 
 | TGID | `6946912345` | ❌ | 接收TG通知的账户数字ID | 
 | SUBNAME | `CF-Workers-SUB` | ❌ | 订阅名称 |
-| SUBAPI | `SUBAPI.cmliussss.net` | ❌ | clash、singbox等 订阅转换后端 | 
+| SUBAPI | `SUBAPI.cmliussss.net` | ❌ | clash、singbox等 订阅转换后端；支持多个后端并自适应优先尝试更健康的节点，绑定 `KV` 时会持久化健康度 |
 | SUBCONFIG | [https://raw.github.../ACL4SSR_Online_MultiCountry.ini](https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini) | ❌ | clash、singbox等 订阅转换配置文件 | 
+| SUBRETRY | `3` | ❌ | 订阅链接拉取失败后的重试次数，范围 `0-5` |
+| SUBTIMEOUT | `1500` | ❌ | 单个订阅链接请求超时时间，单位毫秒，范围 `1000-30000` |
+| SUBAPITIMEOUT | `8000` | ❌ | 订阅转换后端请求超时时间，单位毫秒，范围 `1000-30000` |
+| SUBAPISTAGGER | `250` | ❌ | 多个订阅转换后端的错峰并发间隔，单位毫秒；`0` 为完全串行，范围 `0-3000` |
+| SUBCACHE | `300` | ❌ | 订阅结果缓存时间，单位秒；设为 `0` 可关闭缓存，范围 `0-3600` |
+| SHOW_FAILED_SUB | `0` | ❌ | 是否在订阅结果里显示异常订阅占位节点；`1/true/yes/on` 为开启 |
+| CF_ACCOUNT_ID | `your-account-id` | ❌ | Cloudflare 账号 ID（可在仪表盘 URL 中获取），用于 KV 配额仪表盘 |
+| CF_API_TOKEN | `your-api-token` | ❌ | Cloudflare API Token（需 Account Analytics Read + Account Subscriptions Read 权限），配合 CF_ACCOUNT_ID 使用 |
 
 
 ## ⚠️ 注意事项

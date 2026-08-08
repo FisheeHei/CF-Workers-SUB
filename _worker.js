@@ -1,81 +1,432 @@
-
+﻿
 // 部署完成后在网址后面加上这个，获取自建节点和机场聚合节点，/?token=auto或/auto或
 
-let mytoken = 'auto';
-let guestToken = ''; //可以随便取，或者uuid生成，https://1024tools.com/uuid
-let BotToken = ''; //可以为空，或者@BotFather中输入/start，/newbot，并关注机器人
-let ChatID = ''; //可以为空，或者@userinfobot中获取，/start
-let TG = 0; //小白勿动， 开发者专用，1 为推送所有的访问信息，0 为不推送订阅转换后端的访问信息与异常访问
-let FileName = 'CF-Workers-SUB';
-let SUBUpdateTime = 6; //自定义订阅更新时间，单位小时
-let total = 99;//TB
-let timestamp = 4102329600000;//2099-12-31
+const DEFAULT_CONFIG = {
+	token: 'auto',
+	guestToken: '', //可以随便取，或者uuid生成，https://1024tools.com/uuid
+	botToken: '', //可以为空，或者@BotFather中输入/start，/newbot，并关注机器人
+	chatID: '', //可以为空，或者@userinfobot中获取，/start
+	tg: 0, //小白勿动， 开发者专用，1 为推送所有的访问信息，0 为不推送订阅转换后端的访问信息与异常访问
+	fileName: 'CF-Workers-SUB',
+	subUpdateTime: 6, //自定义订阅更新时间，单位小时
+	subRetry: 1, //订阅链接失败后的重试次数
+	subTimeout: 5000, //单个订阅链接请求超时时间，单位毫秒
+	subApiTimeout: 8000, //订阅转换后端请求超时时间，单位毫秒
+	subApiStagger: 250, //多个订阅转换后端的错峰并发间隔，单位毫秒
+	subCache: 300, //订阅结果缓存时间，单位秒
+	showFailedSub: false,
+	totalTB: 99,
+	timestamp: 4102329600000, //2099-12-31
+};
 
 //节点链接 + 订阅链接
-let MainData = `
+const DEFAULT_MAIN_DATA = `
 https://cfxr.eu.org/getSub
 `;
 
-let urls = [];
-let subConverter = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
-let subConfig = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-let subProtocol = 'https';
+const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
+const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
+const CUSTOM_FIX_VERSION = "custom-fix-2026-08-08-quota-trim";
+// UA 轮换池：首轮用默认UA，重试时依次切换
+// LINK.txt 内存缓存：避免每次请求读KV + 用户编辑后 30s 内生效
+const LINK_TEXT_CACHE = { value: null, ts: 0 };
+const LINK_TEXT_CACHE_TTL = 30000;
+const UA_ROTATION_POOL = [
+	"ClashMeta/1.18 (https://github.com/MetaCubeX/clash.meta)",
+	"sing-box/1.10 (https://github.com/SagerNet/sing-box)",
+	"Stash/3.0 (https://stash.ws)",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+];
+const BYTES_PER_TB = 1099511627776;
+const SUB_CONVERTER_STRATEGY = "adaptive-latency-aware";
+const SUB_CONVERTER_HEALTH_KEY = "__subapi_health_v1__";
+const SUB_CONVERTER_HEALTH_LIMIT = 24;
+const subConverterHealth = new Map();
 
+function normalizeSubConverter(rawValue) {
+	const value = String(rawValue || DEFAULT_SUB_CONVERTER).trim();
+	if (value.startsWith('http://')) return { subProtocol: 'http', subConverter: value.slice('http://'.length).replace(/\/+$/, '') };
+	if (value.startsWith('https://')) return { subProtocol: 'https', subConverter: value.slice('https://'.length).replace(/\/+$/, '') };
+	return { subProtocol: 'https', subConverter: value.replace(/\/+$/, '') };
+}
+
+function normalizeSubConverters(rawValue) {
+	const values = String(rawValue || DEFAULT_SUB_CONVERTER)
+		.split(/[\n,|]+/)
+		.map(value => value.trim())
+		.filter(Boolean);
+	return [...new Map(values.map(value => {
+		const converter = normalizeSubConverter(value);
+		return [`${converter.subProtocol}://${converter.subConverter}`, converter];
+	})).values()];
+}
+
+function getConverterKey(converter) {
+	return `${converter.subProtocol}://${converter.subConverter}`;
+}
+
+function getConverterHealth(converter) {
+	const key = getConverterKey(converter);
+	if (!subConverterHealth.has(key)) {
+		subConverterHealth.set(key, {
+			successCount: 0,
+			failureCount: 0,
+			totalLatency: 0,
+			lastLatency: 0,
+			lastUsedAt: 0,
+			lastSuccessAt: 0,
+			lastFailureAt: 0,
+			consecutiveFailures: 0,
+			updatedAt: 0,
+		});
+	}
+	return subConverterHealth.get(key);
+}
+
+function getAverageLatency(stats) {
+	return stats.successCount > 0 ? stats.totalLatency / stats.successCount : Number.POSITIVE_INFINITY;
+}
+
+function getConverterTier(stats) {
+	if (stats.successCount > 0 && stats.consecutiveFailures === 0) return 0;
+	if (stats.successCount === 0 && stats.failureCount === 0) return 1;
+	return 2;
+}
+
+function compareNumbers(a, b) {
+	return (a || 0) - (b || 0);
+}
+
+function prioritizeSubConverters(converters) {
+	const orderMap = new Map(converters.map((converter, index) => [getConverterKey(converter), index]));
+	return [...converters].sort((left, right) => {
+		const leftStats = getConverterHealth(left);
+		const rightStats = getConverterHealth(right);
+		const leftOrder = orderMap.get(getConverterKey(left)) ?? 0;
+		const rightOrder = orderMap.get(getConverterKey(right)) ?? 0;
+		const tierDiff = getConverterTier(leftStats) - getConverterTier(rightStats);
+		if (tierDiff !== 0) return tierDiff;
+
+		if (getConverterTier(leftStats) === 0) {
+			const leftAverage = getAverageLatency(leftStats);
+			const rightAverage = getAverageLatency(rightStats);
+			const latencyGap = Math.abs(leftAverage - rightAverage);
+			if (latencyGap > 300) return leftAverage - rightAverage;
+			const usageDiff = compareNumbers(leftStats.lastUsedAt, rightStats.lastUsedAt);
+			if (usageDiff !== 0) return usageDiff;
+			return leftAverage - rightAverage;
+		}
+
+		if (getConverterTier(leftStats) === 1) {
+			const usageDiff = compareNumbers(leftStats.lastUsedAt, rightStats.lastUsedAt);
+			if (usageDiff !== 0) return usageDiff;
+			return leftOrder - rightOrder;
+		}
+
+		const failureDiff = leftStats.consecutiveFailures - rightStats.consecutiveFailures;
+		if (failureDiff !== 0) return failureDiff;
+		const retryDiff = compareNumbers(leftStats.lastFailureAt, rightStats.lastFailureAt);
+		if (retryDiff !== 0) return retryDiff;
+		const totalFailureDiff = leftStats.failureCount - rightStats.failureCount;
+		if (totalFailureDiff !== 0) return totalFailureDiff;
+		return leftOrder - rightOrder;
+	});
+}
+
+function recordSubConverterResult(converter, isSuccess, latencyMs) {
+	const stats = getConverterHealth(converter);
+	const now = Date.now();
+	stats.lastUsedAt = now;
+	stats.updatedAt = now;
+	if (Number.isFinite(latencyMs) && latencyMs >= 0) stats.lastLatency = latencyMs;
+
+	if (isSuccess) {
+		stats.successCount += 1;
+		stats.consecutiveFailures = 0;
+		stats.lastSuccessAt = now;
+		if (Number.isFinite(latencyMs) && latencyMs >= 0) stats.totalLatency += latencyMs;
+		return;
+	}
+
+	stats.failureCount += 1;
+	stats.consecutiveFailures += 1;
+	stats.lastFailureAt = now;
+}
+
+function sleep(ms) {
+	return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function normalizeStoredConverterStats(stats = {}) {
+	return {
+		successCount: Number(stats.successCount) || 0,
+		failureCount: Number(stats.failureCount) || 0,
+		totalLatency: Number(stats.totalLatency) || 0,
+		lastLatency: Number(stats.lastLatency) || 0,
+		lastUsedAt: Number(stats.lastUsedAt) || 0,
+		lastSuccessAt: Number(stats.lastSuccessAt) || 0,
+		lastFailureAt: Number(stats.lastFailureAt) || 0,
+		consecutiveFailures: Number(stats.consecutiveFailures) || 0,
+		updatedAt: Number(stats.updatedAt) || 0,
+	};
+}
+
+async function loadPersistedSubConverterHealth(kv, converters, DEBUG = false) {
+	if (!kv) return;
+	try {
+		const raw = await kv.get(SUB_CONVERTER_HEALTH_KEY);
+		if (!raw) return;
+		const parsed = JSON.parse(raw);
+		const entries = parsed?.entries && typeof parsed.entries === 'object' ? parsed.entries : {};
+		for (const converter of converters) {
+			const key = getConverterKey(converter);
+			if (!entries[key]) continue;
+			const currentStats = getConverterHealth(converter);
+			const storedStats = normalizeStoredConverterStats(entries[key]);
+			if (storedStats.updatedAt >= (currentStats.updatedAt || 0)) {
+				subConverterHealth.set(key, storedStats);
+			}
+		}
+		debugLog(DEBUG, `已加载订阅转换后端健康度: ${Object.keys(entries).length}`);
+	} catch (error) {
+		debugLog(DEBUG, '加载订阅转换后端健康度失败', error);
+	}
+}
+
+function serializeSubConverterHealth(converters) {
+	const candidateKeys = converters?.length
+		? [...new Set(converters.map(converter => getConverterKey(converter)))]
+		: [...subConverterHealth.keys()];
+	const entries = candidateKeys
+		.map(key => [key, normalizeStoredConverterStats(subConverterHealth.get(key))])
+		.filter(([, stats]) => stats.successCount > 0 || stats.failureCount > 0)
+		.sort((left, right) => (right[1].updatedAt || 0) - (left[1].updatedAt || 0))
+		.slice(0, SUB_CONVERTER_HEALTH_LIMIT);
+	return Object.fromEntries(entries);
+}
+
+async function persistSubConverterHealth(kv, converters, DEBUG = false) {
+	if (!kv) return;
+	try {
+		const entries = serializeSubConverterHealth(converters);
+		await kv.put(SUB_CONVERTER_HEALTH_KEY, JSON.stringify({
+			updatedAt: Date.now(),
+			entries,
+		}));
+		debugLog(DEBUG, `已持久化订阅转换后端健康度: ${Object.keys(entries).length}`);
+	} catch (error) {
+		debugLog(DEBUG, '持久化订阅转换后端健康度失败', error);
+	}
+}
+
+function isDebugEnabled(env) {
+	return ['1', 'true', 'yes', 'on'].includes(String(env.DEBUG || '').toLowerCase());
+}
+
+function normalizeBoolean(value, fallback = false) {
+	if (value === undefined || value === null || value === '') return fallback;
+	if (typeof value === 'boolean') return value;
+	return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+}
+
+function debugLog(debug, ...args) {
+	if (debug) console.log(...args);
+}
+
+function normalizeNumber(value, fallback, min, max) {
+	const number = Number(value);
+	if (!Number.isFinite(number)) return fallback;
+	return Math.min(max, Math.max(min, Math.floor(number)));
+}
+
+function runInBackground(ctx, promise, DEBUG = false) {
+	const task = Promise.resolve(promise).catch(error => debugLog(DEBUG, error));
+	if (ctx?.waitUntil) ctx.waitUntil(task);
+}
+
+function runtimeHeaders(headers = {}, extra = {}) {
+	const result = new Headers(headers);
+	result.set("X-Custom-Fix-Version", CUSTOM_FIX_VERSION);
+	result.set("X-Content-Type-Options", "nosniff");
+	result.set("Referrer-Policy", "no-referrer");
+	for (const [key, value] of Object.entries(extra)) result.set(key, value);
+	return result;
+}
+
+async function getSubscriptionCache(cacheKey, DEBUG = false) {
+	if (!cacheKey || typeof caches === 'undefined') return null;
+	const cached = await caches.default.match(cacheKey);
+	if (!cached) return null;
+	debugLog(DEBUG, `订阅缓存命中: ${cacheKey.url}`);
+	const headers = runtimeHeaders(cached.headers, { "Cache-Control": "no-cache", "X-Sub-Cache": "HIT" });
+	return new Response(cached.body, { status: cached.status, statusText: cached.statusText, headers });
+}
+
+function storeSubscriptionCache(cacheKey, response, subCache, ctx, DEBUG = false, cacheState = "MISS") {
+	if (!cacheKey || !subCache || typeof caches === 'undefined' || response.status !== 200) return response;
+	const cacheHeaders = runtimeHeaders(response.headers, {
+		"Cache-Control": `public, max-age=${subCache}`,
+		"X-Sub-Cache": cacheState,
+	});
+	const cacheableResponse = new Response(response.clone().body, {
+		status: response.status,
+		statusText: response.statusText,
+		headers: cacheHeaders,
+	});
+	runInBackground(ctx, caches.default.put(cacheKey, cacheableResponse.clone()), DEBUG);
+	const clientHeaders = runtimeHeaders(response.headers, {
+		"Cache-Control": "no-cache",
+		"X-Sub-Cache": cacheState,
+	});
+	return new Response(response.body, {
+		status: response.status,
+		statusText: response.statusText,
+		headers: clientHeaders,
+	});
+}
+
+
+// KV 持久化缓存：订阅结果写入 KV，冷启动后无需重新抓取全量订阅链接
+const SUB_KV_PREFIX = "__sub:";
+const SUB_KV_STALE_TTL_MIN = 3600;
+const SUB_KV_STALE_TTL_MAX = 86400;
+const SUB_KV_STALE_TTL_MULTIPLIER = 6;
+const PREPARED_SUB_PREFIX = "__subsrc:";
+// 订阅失败回退缓存（内存，不写KV）
+const staleCache = new Map(); // key: url, value: {content, expiresAt}
+const preparedSubSources = new Map(); // key: fingerprint, value: {data, expiresAt}
+
+function getSubKvExpirationTtl(ttl) {
+	return Math.min(SUB_KV_STALE_TTL_MAX, Math.max(SUB_KV_STALE_TTL_MIN, ttl * SUB_KV_STALE_TTL_MULTIPLIER));
+}
+
+async function getSubFromKV(kv, cacheSeed, maxAge = 0) {
+	if (!kv) return null;
+	try {
+		const key = SUB_KV_PREFIX + await MD5MD5(cacheSeed);
+		const cached = await kv.get(key);
+		if (!cached) return null;
+		try {
+			const parsed = JSON.parse(cached);
+			if (parsed && typeof parsed.data === 'string') {
+				const ts = Number(parsed.ts) || 0;
+				const age = ts > 0 ? (Date.now() - ts) / 1000 : 0;
+				return { data: parsed.data, age, stale: !!(maxAge && ts && age >= maxAge), legacy: false };
+			}
+		} catch (e) { /* 兼容旧版纯文本缓存 */ }
+		return { data: cached, age: 0, stale: false, legacy: true };
+	} catch (e) { /* KV 读取失败静默降级 */ }
+	return null;
+}
+
+function putSubToKV(kv, cacheSeed, data, ttl, ctx) {
+	if (!kv || !ttl) return;
+	runInBackground(ctx, (async () => {
+		try {
+			const key = SUB_KV_PREFIX + await MD5MD5(cacheSeed);
+			await kv.put(key, JSON.stringify({ data, ts: Date.now() }), { expirationTtl: getSubKvExpirationTtl(ttl) });
+		} catch (e) { /* KV 写入失败静默降级 */ }
+	})(), false);
+}
+
+async function getPreparedSubSource(kv, fingerprint) {
+	if (!/^[a-f0-9]{32}$/i.test(String(fingerprint || ''))) return null;
+	const cached = preparedSubSources.get(fingerprint);
+	if (cached && cached.expiresAt > Date.now()) return cached.data;
+	if (cached) preparedSubSources.delete(fingerprint);
+	if (!kv) return null;
+	try { return await kv.get(PREPARED_SUB_PREFIX + fingerprint); } catch (e) { return null; }
+}
+
+async function putPreparedSubSource(kv, fingerprint, data, ttl) {
+	if (!/^[a-f0-9]{32}$/i.test(String(fingerprint || '')) || !data) return;
+	const expirationTtl = getSubKvExpirationTtl(ttl || DEFAULT_CONFIG.subCache);
+	preparedSubSources.set(fingerprint, { data, expiresAt: Date.now() + expirationTtl * 1000 });
+	if (!kv || !ttl) return;
+	try { await kv.put(PREPARED_SUB_PREFIX + fingerprint, data, { expirationTtl }); } catch (e) {}
+}
 export default {
-	async fetch(request, env) {
+	async fetch(request, env, ctx) {
 		const userAgentHeader = request.headers.get('User-Agent');
 		const userAgent = userAgentHeader ? userAgentHeader.toLowerCase() : "null";
 		const url = new URL(request.url);
 		const token = url.searchParams.get('token');
-		mytoken = env.TOKEN || mytoken;
-		BotToken = env.TGTOKEN || BotToken;
-		ChatID = env.TGID || ChatID;
-		TG = env.TG || TG;
-		subConverter = env.SUBAPI || subConverter;
-		if (subConverter.includes("http://")) {
-			subConverter = subConverter.split("//")[1];
-			subProtocol = 'http';
-		} else {
-			subConverter = subConverter.split("//")[1] || subConverter;
-		}
-		subConfig = env.SUBCONFIG || subConfig;
-		FileName = env.SUBNAME || FileName;
+		const DEBUG = isDebugEnabled(env);
+		const mytoken = env.TOKEN || DEFAULT_CONFIG.token;
+		const BotToken = env.TGTOKEN || DEFAULT_CONFIG.botToken;
+		const ChatID = env.TGID || DEFAULT_CONFIG.chatID;
+		const TG = Number(env.TG ?? DEFAULT_CONFIG.tg);
+		const subConverters = normalizeSubConverters(env.SUBAPI || DEFAULT_SUB_CONVERTER);
+		const subConverterDisplay = subConverters.map(item => `${item.subProtocol}://${item.subConverter}`).join(', ');
+		const subConverterStateBackend = env.KV ? 'KV' : 'MEMORY';
+		const subConfig = env.SUBCONFIG || DEFAULT_SUB_CONFIG;
+		const FileName = env.SUBNAME || DEFAULT_CONFIG.fileName;
+		const subRetry = normalizeNumber(env.SUBRETRY, DEFAULT_CONFIG.subRetry, 0, 5);
+		const subTimeout = normalizeNumber(env.SUBTIMEOUT, DEFAULT_CONFIG.subTimeout, 1000, 30000);
+		const subApiTimeout = normalizeNumber(env.SUBAPITIMEOUT, DEFAULT_CONFIG.subApiTimeout, 1000, 30000);
+		const subApiStagger = normalizeNumber(env.SUBAPISTAGGER, DEFAULT_CONFIG.subApiStagger, 0, 3000);
+		const subCache = normalizeNumber(env.SUBCACHE, DEFAULT_CONFIG.subCache, 0, 3600);
+		const showFailedSub = normalizeBoolean(env.SHOW_FAILED_SUB, DEFAULT_CONFIG.showFailedSub);
+		const cfAccountId = env.CF_ACCOUNT_ID || '';
+		const cfApiToken = env.CF_API_TOKEN || '';
+		const refreshCache = url.searchParams.has('refresh');
 
 		const currentDate = new Date();
 		currentDate.setHours(0, 0, 0, 0);
 		const timeTemp = Math.ceil(currentDate.getTime() / 1000);
 		const fakeToken = await MD5MD5(`${mytoken}${timeTemp}`);
-		guestToken = env.GUESTTOKEN || env.GUEST || guestToken;
+		let guestToken = env.GUESTTOKEN || env.GUEST || DEFAULT_CONFIG.guestToken;
 		if (!guestToken) guestToken = await MD5MD5(mytoken);
 		const 访客订阅 = guestToken;
-		//console.log(`${fakeUserID}\n${fakeHostName}`); // 打印fakeID
 
-		let UD = Math.floor(((timestamp - Date.now()) / timestamp * total * 1099511627776) / 2);
-		total = total * 1099511627776;
+		const timestamp = DEFAULT_CONFIG.timestamp;
+		const total = DEFAULT_CONFIG.totalTB * BYTES_PER_TB;
+		let UD = Math.floor(((timestamp - Date.now()) / timestamp * total) / 2);
 		let expire = Math.floor(timestamp / 1000);
-		SUBUpdateTime = env.SUBUPTIME || SUBUpdateTime;
+		const SUBUpdateTime = env.SUBUPTIME || DEFAULT_CONFIG.subUpdateTime;
 
-		if (!([mytoken, fakeToken, 访客订阅].includes(token) || url.pathname == ("/" + mytoken) || url.pathname.includes("/" + mytoken + "?"))) {
-			if (TG == 1 && url.pathname !== "/" && url.pathname !== "/favicon.ico") await sendMessage(`#异常访问 ${FileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgent}</tg-spoiler>\n域名: ${url.hostname}\n<tg-spoiler>入口: ${url.pathname + url.search}</tg-spoiler>`);
+		if (!([mytoken, fakeToken, 访客订阅].includes(token) || url.pathname == ("/" + mytoken) || url.pathname.startsWith("/" + mytoken + "?") || url.pathname.startsWith("/" + mytoken + "/"))) {
+			if (env.ASSETS && url.pathname.includes('.')) {
+				const assetResponse = await env.ASSETS.fetch(request);
+				if (assetResponse.status !== 404) return assetResponse;
+			}
+			if (TG == 1 && url.pathname !== "/" && url.pathname !== "/favicon.ico") runInBackground(ctx, sendMessage(`#异常访问 ${FileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgent}</tg-spoiler>\n域名: ${url.hostname}\n<tg-spoiler>入口: ${url.pathname + url.search}</tg-spoiler>`, { BotToken, ChatID }), DEBUG);
 			if (env.URL302) return Response.redirect(env.URL302, 302);
-			else if (env.URL) return await proxyURL(env.URL, url);
+			else if (env.URL) return await proxyURL(env.URL, url, DEBUG);
 			else return new Response(await nginx(), {
 				status: 200,
-				headers: {
+				headers: runtimeHeaders({
 					'Content-Type': 'text/html; charset=UTF-8',
-				},
+				}),
 			});
 		} else {
+			const preparedSource = token == fakeToken ? await getPreparedSubSource(env.KV, url.searchParams.get('src')) : null;
+			if (preparedSource) {
+				return new Response(preparedSource, {
+					headers: runtimeHeaders({ "content-type": "text/plain; charset=utf-8" }, { "X-Sub-Cache": "PREPARED" }),
+				});
+			}
+		if (subConverters.length > 0) await loadPersistedSubConverterHealth(env.KV, subConverters, DEBUG);
+			let MainData = DEFAULT_MAIN_DATA;
+		let rawLinkContent = MainData;
+			let urls = [];
 			if (env.KV) {
 				await 迁移地址列表(env, 'LINK.txt');
 				if (userAgent.includes('mozilla') && !url.search) {
-					await sendMessage(`#编辑订阅 ${FileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgentHeader}</tg-spoiler>\n域名: ${url.hostname}\n<tg-spoiler>入口: ${url.pathname + url.search}</tg-spoiler>`);
-					return await KV(request, env, 'LINK.txt', 访客订阅);
+					runInBackground(ctx, sendMessage(`#编辑订阅 ${FileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgentHeader}</tg-spoiler>\n域名: ${url.hostname}\n<tg-spoiler>入口: ${url.pathname + url.search}</tg-spoiler>`, { BotToken, ChatID }), DEBUG);
+					return await KV(request, env, 'LINK.txt', 访客订阅, { ctx, FileName, mytoken, subConverterDisplay, subConverterStateBackend, subConfig, subRetry, subTimeout, subApiTimeout, subApiStagger, subCache, showFailedSub, cfAccountId, cfApiToken });
 				} else {
-					MainData = await env.KV.get('LINK.txt') || MainData;
+					const now = Date.now();
+				if (now - LINK_TEXT_CACHE.ts > LINK_TEXT_CACHE_TTL) {
+					LINK_TEXT_CACHE.value = await env.KV.get('LINK.txt');
+					LINK_TEXT_CACHE.ts = now;
+				}
+				MainData = LINK_TEXT_CACHE.value ?? DEFAULT_MAIN_DATA;
+				rawLinkContent = MainData;
 				}
 			} else {
-				MainData = env.LINK || MainData;
+				MainData = env.LINK || DEFAULT_MAIN_DATA;
+				rawLinkContent = MainData;
 				if (env.LINKSUB) urls = await ADD(env.LINKSUB);
 			}
 			let 重新汇总所有链接 = await ADD(MainData + '\n' + urls.join('\n'));
@@ -90,7 +441,7 @@ export default {
 			}
 			MainData = 自建节点;
 			urls = await ADD(订阅链接);
-			await sendMessage(`#获取订阅 ${FileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgentHeader}</tg-spoiler>\n域名: ${url.hostname}\n<tg-spoiler>入口: ${url.pathname + url.search}</tg-spoiler>`);
+			runInBackground(ctx, sendMessage(`#获取订阅 ${FileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgentHeader}</tg-spoiler>\n域名: ${url.hostname}\n<tg-spoiler>入口: ${url.pathname + url.search}</tg-spoiler>`, { BotToken, ChatID }), DEBUG);
 			const isSubConverterRequest = request.headers.get('subconverter-request') || request.headers.get('subconverter-version') || userAgent.includes('subconverter');
 			let 订阅格式 = 'base64';
 			if (!(userAgent.includes('null') || isSubConverterRequest || userAgent.includes('nekobox') || userAgent.includes(('CF-Workers-SUB').toLowerCase()))) {
@@ -108,8 +459,8 @@ export default {
 			}
 
 			let subConverterUrl;
-			let 订阅转换URL = `${url.origin}/${await MD5MD5(fakeToken)}?token=${fakeToken}`;
-			//console.log(订阅转换URL);
+			const 订阅转换基础URL = `${url.origin}/${await MD5MD5(fakeToken)}?token=${fakeToken}`;
+			let 订阅转换URL = 订阅转换基础URL;
 			let req_data = MainData;
 
 			let 追加UA = 'v2rayn';
@@ -121,26 +472,82 @@ export default {
 			else if (url.searchParams.has('loon')) 追加UA = 'Loon';
 
 			const 订阅链接数组 = [...new Set(urls)].filter(item => item?.trim?.()); // 去重
+			const cacheUrl = new URL(request.url);
+			cacheUrl.searchParams.delete('refresh');
+			const requestCacheSeed = [
+				cacheUrl.toString(),
+				订阅格式,
+				MainData || '',
+				订阅链接数组.join('\n'),
+				env.WARP || '',
+				subConverterDisplay,
+				subConfig,
+				rawLinkContent || '',
+			].join('\n---\n');
+			const baseResponseHeaders = {
+				"content-type": "text/plain; charset=utf-8",
+				"Profile-Update-Interval": `${SUBUpdateTime}`,
+				"Profile-web-page-url": request.url.includes('?') ? request.url.split('?')[0] : request.url,
+				"X-Sub-Converter-Strategy": SUB_CONVERTER_STRATEGY,
+				"X-Sub-Converter-State": subConverterStateBackend,
+			};
+			const kvCachedFinal = (!refreshCache && env.KV && subCache > 0) ? await getSubFromKV(env.KV, requestCacheSeed, subCache) : null;
+			if (kvCachedFinal) {
+				const headers = runtimeHeaders(baseResponseHeaders, {
+					"Cache-Control": "no-cache",
+					"X-Sub-Cache": kvCachedFinal.stale ? "KV-STALE" : "KV-HIT",
+					"X-Sub-Cache-Age": `${Math.max(0, Math.floor(kvCachedFinal.age || 0))}`,
+				});
+				if (订阅格式 != 'base64' && !userAgent.includes('mozilla')) headers.set("Content-Disposition", `attachment; filename*=utf-8''${encodeURIComponent(FileName)}`);
+				// ponytail: SWR 后台重抓已移除，KV 过期即当 cache miss 走正常链路（下条请求自带刷新，节省 subrequest）
+				return new Response(kvCachedFinal.data, { headers });
+			}
+			let selectedSubConverter = '';
+			let subStatus = [];
 			if (订阅链接数组.length > 0) {
-				const 请求订阅响应内容 = await getSUB(订阅链接数组, request, 追加UA, userAgentHeader);
-				console.log(请求订阅响应内容);
+				const 请求订阅响应内容 = await getSUB(订阅链接数组, 追加UA, userAgentHeader, { DEBUG, subRetry, subTimeout, showFailedSub, subConverters, kv: env.KV, ctx, preparedSourceBase: 订阅转换基础URL, subCache });
+				debugLog(DEBUG, 请求订阅响应内容);
+				subStatus = 请求订阅响应内容[2] || [];
 				req_data += 请求订阅响应内容[0].join('\n');
 				订阅转换URL += "|" + 请求订阅响应内容[1];
-				if (订阅格式 == 'base64' && !isSubConverterRequest && 请求订阅响应内容[1].includes('://')) {
-					subConverterUrl = `${subProtocol}://${subConverter}/sub?target=mixed&url=${encodeURIComponent(请求订阅响应内容[1])}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false&new_name=true`;
-					try {
-						const subConverterResponse = await fetch(subConverterUrl, { headers: { 'User-Agent': 'v2rayN/CF-Workers-SUB  (https://github.com/cmliu/CF-Workers-SUB)' } });
-						if (subConverterResponse.ok) {
-							const subConverterContent = await subConverterResponse.text();
-							req_data += '\n' + atob(subConverterContent);
+				if (!isSubConverterRequest && 请求订阅响应内容[1].includes('://')) {
+					for (const sourceChunk of splitSubConverterSources(请求订阅响应内容[1])) {
+						try {
+							const { text: subConverterContent, converter: mixedSubConverter } = await fetchSubConverterText(subConverters, converter => buildSubConverterUrl(converter, 'mixed', sourceChunk, subConfig), { 'User-Agent': 'v2rayN/CF-Workers-SUB  (https://github.com/cmliu/CF-Workers-SUB)' }, { DEBUG, subApiTimeout, subApiStagger, kv: env.KV, ctx });
+							if (mixedSubConverter) selectedSubConverter = mixedSubConverter;
+							req_data += '\n' + (tryDecodeBase64(subConverterContent) || subConverterContent);
+						} catch (error) {
+							debugLog(DEBUG, '订阅转换请回base64失败，检查订阅转换后端是否正常运行', error);
 						}
-					} catch (error) {
-						console.log('订阅转换请回base64失败，检查订阅转换后端是否正常运行');
 					}
 				}
 			}
 
-			if (env.WARP) 订阅转换URL += "|" + (await ADD(env.WARP)).join("|");
+			if (env.WARP) req_data += '\n' + (await ADD(env.WARP)).join("\n");
+			const sourceFingerprint = await MD5MD5([
+				req_data,
+				订阅转换URL,
+				订阅格式,
+				subConverterDisplay,
+				subConfig,
+				rawLinkContent || '',
+			].join('\n---\n'));
+			订阅转换URL = `${订阅转换基础URL}&src=${sourceFingerprint}`;
+
+			const cacheSeed = [
+				cacheUrl.toString(),
+				订阅格式,
+				sourceFingerprint,
+				env.WARP || '',
+				subConverterDisplay,
+				subConfig,
+				rawLinkContent || '',
+			].join('\n---\n');
+			const cacheKey = request.method === "GET" && subCache > 0
+				? new Request(`${url.origin}/__sub-cache/${await MD5MD5(cacheSeed)}`, { method: "GET" })
+				: null;
+			const cachedResponse = refreshCache ? null : await getSubscriptionCache(cacheKey, DEBUG);
+			if (cachedResponse) return cachedResponse;
 			//修复中文错误
 			const utf8Encoder = new TextEncoder();
 			const encodedData = utf8Encoder.encode(req_data);
@@ -151,9 +558,7 @@ export default {
 			//去重
 			const uniqueLines = new Set(text.split('\n'));
 			const result = [...uniqueLines].join('\n');
-			//console.log(result);
-
-			let base64Data;
+			let base64Data = null;
 			try {
 				base64Data = btoa(result);
 			} catch (e) {
@@ -179,51 +584,68 @@ export default {
 
 				base64Data = encodeBase64(result)
 			}
+			if (订阅格式 != 'base64' && token != fakeToken) await putPreparedSubSource(env.KV, sourceFingerprint, base64Data, subCache);
 
 			// 构建响应头对象
 			const responseHeaders = {
-				"content-type": "text/plain; charset=utf-8",
-				"Profile-Update-Interval": `${SUBUpdateTime}`,
-				"Profile-web-page-url": request.url.includes('?') ? request.url.split('?')[0] : request.url,
+				...baseResponseHeaders,
 				//"Subscription-Userinfo": `upload=${UD}; download=${UD}; total=${total}; expire=${expire}`,
 			};
+			responseHeaders["X-Sub-Source-Fingerprint"] = sourceFingerprint;
+			if (selectedSubConverter) responseHeaders["X-Sub-Converter"] = selectedSubConverter;
+			responseHeaders["X-Sub-Converter-Strategy"] = SUB_CONVERTER_STRATEGY;
+			if (subStatus && subStatus.length) responseHeaders["X-Sub-Fetch-Status"] = compactSubStatusHeader(subStatus);
+			responseHeaders["X-Sub-Converter-State"] = subConverterStateBackend;
 
 			if (订阅格式 == 'base64' || token == fakeToken) {
-				return new Response(base64Data, { headers: responseHeaders });
+				const response = new Response(base64Data, { headers: runtimeHeaders(responseHeaders) });
+				putSubToKV(env.KV, requestCacheSeed, base64Data, subCache, ctx);
+				return storeSubscriptionCache(cacheKey, response, subCache, ctx, DEBUG, refreshCache ? "REFRESH" : "MISS");
 			} else if (订阅格式 == 'clash') {
-				subConverterUrl = `${subProtocol}://${subConverter}/sub?target=clash&url=${encodeURIComponent(订阅转换URL)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false&new_name=true`;
+				subConverterUrl = converter => buildSubConverterUrl(converter, 'clash', 订阅转换URL, subConfig);
 			} else if (订阅格式 == 'singbox') {
-				subConverterUrl = `${subProtocol}://${subConverter}/sub?target=singbox&url=${encodeURIComponent(订阅转换URL)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false&new_name=true`;
+				subConverterUrl = converter => buildSubConverterUrl(converter, 'singbox', 订阅转换URL, subConfig);
 			} else if (订阅格式 == 'surge') {
-				subConverterUrl = `${subProtocol}://${subConverter}/sub?target=surge&ver=4&url=${encodeURIComponent(订阅转换URL)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false&new_name=true`;
+				subConverterUrl = converter => buildSubConverterUrl(converter, 'surge', 订阅转换URL, subConfig, 'ver=4');
 			} else if (订阅格式 == 'quanx') {
-				subConverterUrl = `${subProtocol}://${subConverter}/sub?target=quanx&url=${encodeURIComponent(订阅转换URL)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false&udp=true`;
+				subConverterUrl = converter => buildSubConverterUrl(converter, 'quanx', 订阅转换URL, subConfig, 'udp=true');
 			} else if (订阅格式 == 'loon') {
-				subConverterUrl = `${subProtocol}://${subConverter}/sub?target=loon&url=${encodeURIComponent(订阅转换URL)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false`;
+				subConverterUrl = converter => buildSubConverterUrl(converter, 'loon', 订阅转换URL, subConfig);
 			}
-			//console.log(订阅转换URL);
 			try {
-				const subConverterResponse = await fetch(subConverterUrl, { headers: { 'User-Agent': userAgentHeader } });//订阅转换
-				if (!subConverterResponse.ok) return new Response(base64Data, { headers: responseHeaders });
-				let subConverterContent = await subConverterResponse.text();
+				const converterResult = await fetchSubConverterText(subConverters, subConverterUrl, { 'User-Agent': userAgentHeader }, { DEBUG, subApiTimeout, subApiStagger, kv: env.KV, ctx });//订阅转换
+				selectedSubConverter = converterResult.converter || selectedSubConverter;
+				responseHeaders["X-Sub-Converter"] = selectedSubConverter;
+				let subConverterContent = converterResult.text;
 				if (订阅格式 == 'clash') subConverterContent = await clashFix(subConverterContent);
 				// 只有非浏览器订阅才会返回SUBNAME
-				if (!userAgent.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(FileName)}`;
-				return new Response(subConverterContent, { headers: responseHeaders });
+				const headers = runtimeHeaders(responseHeaders);
+				if (!userAgent.includes('mozilla')) headers.set("Content-Disposition", `attachment; filename*=utf-8''${encodeURIComponent(FileName)}`);
+				const response = new Response(subConverterContent, { headers });
+				putSubToKV(env.KV, requestCacheSeed, subConverterContent, subCache, ctx);
+				return storeSubscriptionCache(cacheKey, response, subCache, ctx, DEBUG, refreshCache ? "REFRESH" : "MISS");
 			} catch (error) {
-				return new Response(base64Data, { headers: responseHeaders });
+				return new Response(base64Data, { headers: runtimeHeaders(responseHeaders, { "X-Sub-Cache": "BYPASS" }) });
 			}
 		}
 	}
 };
 
+function splitLinkText(envadd) {
+	if (!envadd) return [];
+	const addtext = String(envadd).replace(/[	"'|\r\n]+/g, '\n').replace(/\n+/g, '\n').trim();
+	if (!addtext) return [];
+	return addtext.split('\n').map(item => item.trim()).filter(Boolean);
+}
+
+function summarizeLinks(envadd) {
+	const lines = splitLinkText(envadd);
+	const remote = lines.filter(item => item.toLowerCase().startsWith('http')).length;
+	return { total: lines.length, remote, local: lines.length - remote };
+}
+
 async function ADD(envadd) {
-	var addtext = envadd.replace(/[	"'|\r\n]+/g, '\n').replace(/\n+/g, '\n');	// 替换为换行
-	//console.log(addtext);
-	if (addtext.charAt(0) == '\n') addtext = addtext.slice(1);
-	if (addtext.charAt(addtext.length - 1) == '\n') addtext = addtext.slice(0, addtext.length - 1);
-	const add = addtext.split('\n');
-	//console.log(add);
+	const add = splitLinkText(envadd);
 	return add;
 }
 
@@ -234,31 +656,26 @@ async function nginx() {
 	<head>
 	<title>Welcome to nginx!</title>
 	<style>
-		body {
-			width: 35em;
-			margin: 0 auto;
-			font-family: Tahoma, Verdana, Arial, sans-serif;
-		}
+		body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-serif; }
+		h1 { color: #1a73e8; }
+		.footer { color: #999; font-size: 12px; margin-top: 2em; }
+		.highlight { background: linear-gradient(90deg, #1a73e8, #34a853); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
 	</style>
 	</head>
 	<body>
 	<h1>Welcome to nginx!</h1>
-	<p>If you see this page, the nginx web server is successfully installed and
-	working. Further configuration is required.</p>
-	
-	<p>For online documentation and support please refer to
-	<a href="http://nginx.org/">nginx.org</a>.<br/>
-	Commercial support is available at
-	<a href="http://nginx.com/">nginx.com</a>.</p>
-	
-	<p><em>Thank you for using nginx.</em></p>
+	<p>If you see this page, the nginx web server is successfully installed and working. Further configuration is required.</p>
+	<p class="highlight">Powered by Cloudflare Workers</p>
+	<hr>
+	<p class="footer"><em>Thank you for using nginx.</em><br>Modified by <strong>FisheeHei</strong></p>
 	</body>
 	</html>
-	`
+	`;
 	return text;
 }
 
-async function sendMessage(type, ip, add_data = "") {
+async function sendMessage(type, ip, add_data = "", config = {}) {
+	const { BotToken = '', ChatID = '' } = config;
 	if (BotToken !== '' && ChatID !== '') {
 		let msg = "";
 		const response = await fetch(`http://ip-api.com/json/${ip}?lang=zh-CN`);
@@ -285,6 +702,33 @@ function base64Decode(str) {
 	const bytes = new Uint8Array(atob(str).split('').map(c => c.charCodeAt(0)));
 	const decoder = new TextDecoder('utf-8');
 	return decoder.decode(bytes);
+}
+
+function tryDecodeBase64(str) {
+	const raw = String(str || '');
+	if (!raw) return null;
+	// 方案1：标准base64（剥除非base64字符后重试）
+	const stdClean = raw.replace(/[^A-Za-z0-9+/=]/g, '');
+	if (stdClean && stdClean.length % 4 !== 1) {
+		try {
+			const decoded = base64Decode(stdClean);
+			if (decoded && /[a-z]+:\/\//.test(decoded)) return decoded;
+		} catch (_) {}
+	}
+	// 方案2：URL-safe base64（- 替换为 +, _ 替换为 /）
+	const urlClean = raw.replace(/[^A-Za-z0-9+/=_-]/g, '').replace(/-/g, '+').replace(/_/g, '/');
+	if (urlClean && urlClean.length % 4 !== 1) {
+		try {
+			const decoded = base64Decode(urlClean);
+			if (decoded && /[a-z]+:\/\//.test(decoded)) return decoded;
+		} catch (_) {}
+	}
+	// 方案3：保留原始严格检查（兼容旧行为）
+	const strictClean = raw.replace(/\s/g, '');
+	if (strictClean && strictClean.length % 4 !== 1 && /^[A-Za-z0-9+/]+={0,2}$/.test(strictClean)) {
+		try { return base64Decode(strictClean); } catch (_) {}
+	}
+	return null;
 }
 
 async function MD5MD5(text) {
@@ -326,13 +770,112 @@ function clashFix(content) {
 	return content;
 }
 
-async function proxyURL(proxyURL, url) {
+function buildSubConverterUrl(converter, target, sourceUrl, subConfig, extraQuery = '') {
+	const extra = extraQuery ? `&${extraQuery}` : '';
+	return `${converter.subProtocol}://${converter.subConverter}/sub?target=${target}${extra}&url=${encodeURIComponent(sourceUrl)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false&new_name=true`;
+}
+
+const SUB_CONVERTER_SOURCE_URL_LIMIT = 6000;
+const SUB_STATUS_HEADER_LIMIT = 3500;
+
+function splitSubConverterSources(sourceUrls, maxLength = SUB_CONVERTER_SOURCE_URL_LIMIT) {
+	const items = String(sourceUrls || '').split('|').map(item => item.trim()).filter(Boolean);
+	const chunks = [];
+	let current = '';
+	for (const item of items) {
+		const next = current ? `${current}|${item}` : item;
+		if (current && encodeURIComponent(next).length > maxLength) {
+			chunks.push(current);
+			current = item;
+		} else {
+			current = next;
+		}
+	}
+	if (current) chunks.push(current);
+	return chunks;
+}
+
+function compactSubStatusHeader(statuses, maxLength = SUB_STATUS_HEADER_LIMIT) {
+	const parts = [];
+	let used = 0;
+	let omitted = 0;
+	for (const status of statuses || []) {
+		const value = String(status || '').trim();
+		if (!value) continue;
+		const extra = (parts.length ? 2 : 0) + value.length;
+		if (used + extra > maxLength) {
+			omitted++;
+			continue;
+		}
+		parts.push(value);
+		used += extra;
+	}
+	if (omitted > 0) parts.push(`... ${omitted} more`);
+	return parts.join("; ");
+}
+
+async function requestSubConverter(converter, buildUrl, headers, options = {}) {
+	const { DEBUG = false, subApiTimeout = DEFAULT_CONFIG.subApiTimeout } = options;
+	const converterUrl = buildUrl(converter);
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), subApiTimeout);
+	const startedAt = Date.now();
+	try {
+		const response = await fetch(converterUrl, { headers, signal: controller.signal });
+		if (!response.ok) throw new Error(`HTTP ${response.status}`);
+		const latencyMs = Date.now() - startedAt;
+		recordSubConverterResult(converter, true, latencyMs);
+		debugLog(DEBUG, `订阅转换成功: ${converter.subProtocol}://${converter.subConverter} ${latencyMs}ms`);
+		return { text: await response.text(), converter: getConverterKey(converter), latencyMs };
+	} catch (error) {
+		recordSubConverterResult(converter, false, Date.now() - startedAt);
+		debugLog(DEBUG, `订阅转换失败: ${converterUrl}`, error);
+		throw error;
+	} finally {
+		clearTimeout(timeout);
+	}
+}
+
+async function fetchSubConverterText(converters, buildUrl, headers, options = {}) {
+	const { DEBUG = false, subApiTimeout = DEFAULT_CONFIG.subApiTimeout, subApiStagger = DEFAULT_CONFIG.subApiStagger, kv = null, ctx = null } = options;
+	const prioritizedConverters = prioritizeSubConverters(converters);
+	if (prioritizedConverters.length === 0) throw new Error('未配置订阅转换后端');
+
+	try {
+		if (prioritizedConverters.length === 1 || subApiStagger === 0) {
+			let lastError;
+			for (const converter of prioritizedConverters) {
+				try {
+					return await requestSubConverter(converter, buildUrl, headers, { DEBUG, subApiTimeout });
+				} catch (error) {
+					lastError = error;
+				}
+			}
+			throw lastError || new Error('所有订阅转换后端均不可用');
+		}
+
+		const delayedRequests = prioritizedConverters.map((converter, index) => (async () => {
+			const delayMs = index * subApiStagger;
+			if (delayMs > 0) await sleep(delayMs);
+			return requestSubConverter(converter, buildUrl, headers, { DEBUG, subApiTimeout });
+		})());
+
+		return await Promise.any(delayedRequests);
+	} catch (error) {
+		const lastError = error?.errors?.[error.errors.length - 1];
+		throw lastError || error || new Error('所有订阅转换后端均不可用');
+	} finally {
+		runInBackground(ctx, persistSubConverterHealth(kv, prioritizedConverters, DEBUG), DEBUG);
+	}
+}
+
+async function proxyURL(proxyURL, url, DEBUG = false) {
 	const URLs = await ADD(proxyURL);
 	const fullURL = URLs[Math.floor(Math.random() * URLs.length)];
 
 	// 解析目标 URL
 	let parsedURL = new URL(fullURL);
-	console.log(parsedURL);
+	debugLog(DEBUG, parsedURL);
 	// 提取并可能修改 URL 组件
 	let URLProtocol = parsedURL.protocol.slice(0, -1) || 'https';
 	let URLHostname = parsedURL.hostname;
@@ -366,95 +909,222 @@ async function proxyURL(proxyURL, url) {
 	return newResponse;
 }
 
-async function getSUB(api, request, 追加UA, userAgentHeader) {
+// 熔断机制: 连续失败超过阈值的订阅链接暂时跳过
+const circuitBreaker = new Map(); // key: url, value: {failures, cooldownUntil}
+const CIRCUIT_COOLDOWN_MS = 60000; // 1分钟冷却期
+const CIRCUIT_FAILURE_THRESHOLD = 2;
+const FETCH_CONCURRENCY = 8; // 每批并发数
+
+async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
+	const { DEBUG = false, subRetry = DEFAULT_CONFIG.subRetry, subTimeout = DEFAULT_CONFIG.subTimeout, showFailedSub = DEFAULT_CONFIG.showFailedSub, subConverters = null, kv = null, ctx = null, preparedSourceBase = '', subCache = DEFAULT_CONFIG.subCache } = options;
 	if (!api || api.length === 0) {
 		return [];
 	} else api = [...new Set(api)]; // 去重
 	let newapi = "";
 	let 订阅转换URLs = "";
 	let 异常订阅 = "";
-	const controller = new AbortController(); // 创建一个AbortController实例，用于取消请求
-	const timeout = setTimeout(() => {
-		controller.abort(); // 2秒后取消所有请求
-	}, 2000);
+	let subStatus = [];
 
 	try {
-		// 使用Promise.allSettled等待所有API请求完成，无论成功或失败
-		const responses = await Promise.allSettled(api.map(apiUrl => getUrl(request, apiUrl, 追加UA, userAgentHeader).then(response => response.ok ? response.text() : Promise.reject(response))));
+		// 分批并发抓取，避免瞬间洪峰 + 熔断检查
+		const now = Date.now();
+		const activeUrls = [];
+		for (const apiUrl of api) {
+			const cb = circuitBreaker.get(apiUrl);
+			if (cb && cb.cooldownUntil > now) {
+				subStatus.push(apiUrl + ' CIRCUIT_OPEN');
+				debugLog(DEBUG, `熔断跳过: ${apiUrl}`);
+				continue;
+			}
+			activeUrls.push(apiUrl);
+		}
+		const responses = [];
+		for (let i = 0; i < activeUrls.length; i += FETCH_CONCURRENCY) {
+			const batch = activeUrls.slice(i, i + FETCH_CONCURRENCY);
+			const batchResults = await Promise.allSettled(batch.map(apiUrl => fetchSubscription(apiUrl, 追加UA, userAgentHeader, { DEBUG, subRetry, subTimeout })));
+			batchResults.forEach((result, j) => {
+				responses.push({ apiUrl: batch[j], result });
+			});
+		}
 
 		// 遍历所有响应
-		const modifiedResponses = responses.map((response, index) => {
+		const modifiedResponses = responses.map((item) => {
+			const apiUrl = item.apiUrl;
+			const settled = item.result;
 			// 检查是否请求成功
-			if (response.status === 'rejected') {
-				const reason = response.reason;
-				if (reason && reason.name === 'AbortError') {
-					return {
-						status: '超时',
-						value: null,
-						apiUrl: api[index] // 将原始的apiUrl添加到返回对象中
-					};
+			if (settled.status === 'rejected') {
+				const reason = settled.reason;
+				// 熔断: 记录失败次数
+				const cb = circuitBreaker.get(apiUrl) || { failures: 0, cooldownUntil: 0 };
+				cb.failures++;
+				if (cb.failures >= Math.max(CIRCUIT_FAILURE_THRESHOLD, subRetry + 1)) {
+					cb.cooldownUntil = Date.now() + CIRCUIT_COOLDOWN_MS;
 				}
-				console.error(`请求失败: ${api[index]}, 错误信息: ${reason.status} ${reason.statusText}`);
-				return {
-					status: '请求失败',
-					value: null,
-					apiUrl: api[index] // 将原始的apiUrl添加到返回对象中
-				};
+				circuitBreaker.set(apiUrl, cb);
+				if (reason && reason.name === 'AbortError') {
+					subStatus.push(apiUrl + " TIMEOUT");
+					return { status: '超时', value: null, apiUrl };
+				}
+				subStatus.push(apiUrl + " FAIL " + (reason.status || reason.name || "unknown"));
+				debugLog(DEBUG, `请求失败: ${apiUrl}, 错误信息: ${reason.status} ${reason.statusText}`);
+				return { status: '请求失败', value: null, apiUrl };
 			}
-			return {
-				status: response.status,
-				value: response.value,
-				apiUrl: api[index] // 将原始的apiUrl添加到返回对象中
-			};
+			// 成功: 重置熔断计数
+			circuitBreaker.delete(apiUrl);
+			return { status: settled.status, value: settled.value, apiUrl };
 		});
 
-		console.log(modifiedResponses); // 输出修改后的响应数组
+		debugLog(DEBUG, modifiedResponses); // 输出修改后的响应数组
 
 		for (const response of modifiedResponses) {
 			// 检查响应状态是否为'fulfilled'
 			if (response.status === 'fulfilled') {
+				subStatus.push(response.apiUrl + " OK");
 				const content = await response.value || 'null'; // 获取响应的内容
-				if (content.includes('proxies:')) {
-					//console.log('Clash订阅: ' + response.apiUrl);
-					订阅转换URLs += "|" + response.apiUrl; // Clash 配置
-				} else if (content.includes('outbounds"') && content.includes('inbounds"')) {
-					//console.log('Singbox订阅: ' + response.apiUrl);
-					订阅转换URLs += "|" + response.apiUrl; // Singbox 配置
+				if (content.includes('proxies:') || (content.includes('outbounds"') && content.includes('inbounds"'))) {
+					if (kv && preparedSourceBase) {
+						const sourceFingerprint = await MD5MD5(response.apiUrl + '\n---\n' + content);
+						await putPreparedSubSource(kv, sourceFingerprint, content, subCache);
+						订阅转换URLs += `|${preparedSourceBase}&src=${sourceFingerprint}`; // Clash/Singbox 配置
+					} else {
+						订阅转换URLs += "|" + response.apiUrl; // Clash/Singbox 配置
+					}
 				} else if (content.includes('://')) {
-					//console.log('明文订阅: ' + response.apiUrl);
 					newapi += content + '\n'; // 追加内容
-				} else if (isValidBase64(content)) {
-					//console.log('Base64订阅: ' + response.apiUrl);
-					newapi += base64Decode(content) + '\n'; // 解码并追加内容
 				} else {
-					const 异常订阅LINK = `trojan://CMLiussss@127.0.0.1:8888?security=tls&allowInsecure=1&type=tcp&headerType=none#%E5%BC%82%E5%B8%B8%E8%AE%A2%E9%98%85%20${response.apiUrl.split('://')[1].split('/')[0]}`;
-					console.log('异常订阅: ' + 异常订阅LINK);
-					异常订阅 += `${异常订阅LINK}\n`;
+					const decodedContent = tryDecodeBase64(content);
+					if (decodedContent !== null) {
+						newapi += decodedContent + '\n'; // 解码并追加内容
+					} else {
+						// fallback: extract :// URIs from raw response
+						const rawLines = String(content || "").split(/[\r\n]+/);
+						let hasExtractedNodes = false;
+						for (const rawLine of rawLines) {
+							if (/^[a-z]+:\/\//i.test(rawLine.trim())) {
+								newapi += rawLine.trim() + "\n";
+								hasExtractedNodes = true;
+							}
+						}
+						if (!hasExtractedNodes) {
+						const 异常订阅LINK = `trojan://CMLiussss@127.0.0.1:8888?security=tls&allowInsecure=1&type=tcp&headerType=none#%E5%BC%82%E5%B8%B8%E8%AE%A2%E9%98%85%20${response.apiUrl.split('://')[1].split('/')[0]}`;
+						debugLog(DEBUG, '异常订阅: ' + 异常订阅LINK);
+						if (showFailedSub) 异常订阅 += `${异常订阅LINK}\n`;
+						}
+					}
 				}
 			}
 		}
+		// 成功抓取的内容存入内存 stale cache（不写KV）
+		for (const response of modifiedResponses) {
+			if (response.status === 'fulfilled' && response.value) {
+				const staleContent = String(response.value || '');
+				staleCache.set(response.apiUrl, { content: staleContent, expiresAt: Date.now() + 86400000 });
+			}
+		}
+		// SUBAPI代理公底: 直连失败的订阅改走 SUBAPI 代为抓取
+		if (subConverters && subConverters.length > 0) {
+			const failedUrls = modifiedResponses.filter(r => r.status !== 'fulfilled');
+			for (const failed of failedUrls) {
+				let fallbackOk = false;
+				// ponytail: 代理回退收敛为单次（仅最健康后端），省 subrequest
+				const fallbackConverter = prioritizeSubConverters(subConverters)[0];
+				if (fallbackConverter) {
+					const proxyUrl = `${fallbackConverter.subProtocol}://${fallbackConverter.subConverter}/sub?target=auto&url=${encodeURIComponent(failed.apiUrl)}&insert=false`;
+					try {
+						const controller = new AbortController();
+						const timer = setTimeout(() => controller.abort(), subTimeout);
+						const proxyResp = await fetch(proxyUrl, { headers: { 'User-Agent': userAgentHeader || `v2rayN/CF-Workers-SUB` }, signal: controller.signal });
+						clearTimeout(timer);
+						if (!proxyResp.ok) throw new Error(`SUBAPI HTTP ${proxyResp.status}`);
+						const proxyContent = await proxyResp.text();
+						const fallbackContent = tryDecodeBase64(proxyContent) || (/^[a-z]+:\/\//im.test(proxyContent) ? proxyContent : null);
+						if (fallbackContent) {
+							newapi += fallbackContent + '\n';
+							failed.status = 'fulfilled';
+							failed.value = fallbackContent;
+							staleCache.set(failed.apiUrl, { content: fallbackContent, expiresAt: Date.now() + 86400000 });
+							const statusIndex = subStatus.findIndex(s => s.startsWith(failed.apiUrl));
+							if (statusIndex >= 0) subStatus[statusIndex] = failed.apiUrl + ' SUBAPI_OK';
+							fallbackOk = true;
+						}
+					} catch (e) {
+						debugLog(DEBUG, `SUBAPI fallback failed for ${failed.apiUrl}:`, e.message || e);
+					}
+				}
+				if (!fallbackOk) {
+					const statusIndex = subStatus.findIndex(s => s.startsWith(failed.apiUrl));
+					if (statusIndex >= 0) subStatus[statusIndex] = failed.apiUrl + ' SUBAPI_FAIL';
+				}
+			}
+		}
+		// SUBAPI 也失败的订阅：尝试从内存 stale cache 恢复
+		for (const response of modifiedResponses) {
+			if (response.status !== 'fulfilled' && response.apiUrl) {
+				const cached = staleCache.get(response.apiUrl);
+				if (cached && cached.expiresAt > Date.now() && cached.content) {
+					response.value = cached.content;
+					response.status = 'fulfilled';
+					response.fromStale = true;
+				}
+			}
+		}
+		// 从 stale cache 恢复的响应，立即在本轮处理
+		for (const response of modifiedResponses) {
+			if (response.fromStale && response.value) {
+				const staleContent = response.value;
+				const decoded = tryDecodeBase64(staleContent);
+				if (decoded) {
+					newapi += decoded + '\n';
+				} else if (/^[a-z]+:\/\//im.test(staleContent)) {
+					newapi += staleContent + '\n';
+				}
+				subStatus[subStatus.findIndex(s => s.startsWith(response.apiUrl))] = response.apiUrl + ' STALE_CACHE';
+			}
+		}
 	} catch (error) {
-		console.error(error); // 捕获并输出错误信息
-	} finally {
-		clearTimeout(timeout); // 清除定时器
+		debugLog(DEBUG, error); // 捕获并输出错误信息
 	}
 
 	const 订阅内容 = await ADD(newapi + 异常订阅); // 将处理后的内容转换为数组
 	// 返回处理后的结果
-	return [订阅内容, 订阅转换URLs];
+	return [订阅内容, 订阅转换URLs, subStatus];
 }
 
-async function getUrl(request, targetUrl, 追加UA, userAgentHeader) {
+async function fetchSubscription(targetUrl, 追加UA, userAgentHeader, options = {}) {
+	const { DEBUG = false, subRetry = DEFAULT_CONFIG.subRetry, subTimeout = DEFAULT_CONFIG.subTimeout } = options;
+	let lastError;
+	for (let attempt = 0; attempt <= subRetry; attempt++) {
+		// 首轮用默认UA，重试时轮换到备选UA
+		const effectiveUA = attempt === 0 ? 追加UA : (UA_ROTATION_POOL[(attempt - 1) % UA_ROTATION_POOL.length]);
+		const controller = new AbortController();
+		const timeout = setTimeout(() => controller.abort(), subTimeout);
+		try {
+			const response = await getUrl(targetUrl, effectiveUA, userAgentHeader, controller.signal, DEBUG);
+			if (!response.ok) throw response;
+			return await response.text();
+		} catch (error) {
+			lastError = error;
+			debugLog(DEBUG, `订阅请求失败 ${targetUrl} attempt=${attempt + 1}/${subRetry + 1}`, error?.status || error?.name || error);
+			if (attempt >= subRetry) throw error;
+		} finally {
+			clearTimeout(timeout);
+		}
+	}
+	throw lastError;
+}
+
+async function getUrl(targetUrl, 追加UA, userAgentHeader, signal, DEBUG = false) {
 	// 设置自定义 User-Agent
-	const newHeaders = new Headers(request.headers);
+	const newHeaders = new Headers();
 	newHeaders.set("User-Agent", `${atob('djJyYXlOLzYuNDU=')} cmliu/CF-Workers-SUB ${追加UA}(${userAgentHeader})`);
+	newHeaders.set("Accept", "text/plain, application/json, application/yaml, */*");
 
 	// 构建新的请求对象
 	const modifiedRequest = new Request(targetUrl, {
-		method: request.method,
+		method: "GET",
 		headers: newHeaders,
-		body: request.method === "GET" ? null : request.body,
 		redirect: "follow",
+		signal,
 		cf: {
 			// 忽略SSL证书验证
 			insecureSkipVerify: true,
@@ -466,20 +1136,12 @@ async function getUrl(request, targetUrl, 追加UA, userAgentHeader) {
 	});
 
 	// 输出请求的详细信息
-	console.log(`请求URL: ${targetUrl}`);
-	console.log(`请求头: ${JSON.stringify([...newHeaders])}`);
-	console.log(`请求方法: ${request.method}`);
-	console.log(`请求体: ${request.method === "GET" ? null : request.body}`);
+	debugLog(DEBUG, `请求URL: ${targetUrl}`);
+	debugLog(DEBUG, `请求头: ${JSON.stringify([...newHeaders])}`);
+	debugLog(DEBUG, "请求方法: GET");
 
 	// 发送请求并返回响应
 	return fetch(modifiedRequest);
-}
-
-function isValidBase64(str) {
-	// 先移除所有空白字符(空格、换行、回车等)
-	const cleanStr = str.replace(/\s/g, '');
-	const base64Regex = /^[A-Za-z0-9+/=]+$/;
-	return base64Regex.test(cleanStr);
 }
 
 async function 迁移地址列表(env, txt = 'ADD.txt') {
@@ -496,7 +1158,79 @@ async function 迁移地址列表(env, txt = 'ADD.txt') {
 	return false;
 }
 
-async function KV(request, env, txt = 'ADD.txt', guest) {
+
+
+async function fetchKvUsage(accountId, apiToken) {
+	if (!accountId || !apiToken) return { ok: false, reason: 'no_credentials' };
+	try {
+		// Filter for today's operations (00:00 UTC onwards) and group by actionType to separate reads/writes
+		const now = new Date();
+		const today = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+		const todayISO = today.toISOString();
+		const query = JSON.stringify({
+			query: '{viewer{accounts(filter:{accountTag:"' + accountId + '"}){kvOperationsAdaptiveGroups(limit:10,filter:{datetime_geq:"' + todayISO + '"},orderBy:[actionType_ASC]){dimensions{actionType}sum{requests}}}}}'
+		});
+		const resp = await fetch('https://api.cloudflare.com/client/v4/graphql', {
+			method: 'POST',
+			headers: { "Authorization": "Bearer " + apiToken, "Content-Type": "application/json" },
+			body: query,
+		});
+		if (!resp.ok) return { ok: false, reason: 'http_' + resp.status };
+		const data = await resp.json();
+		if (data.errors && data.errors.length > 0) {
+			return { ok: false, reason: 'graphql_err: ' + data.errors[0].message };
+		}
+		const groups = data?.data?.viewer?.accounts?.[0]?.kvOperationsAdaptiveGroups;
+		if (!groups || groups.length === 0) {
+			return { ok: false, reason: 'no_data' };
+		}
+		let reads = 0, writes = 0;
+		for (const group of groups) {
+			const action = (group.dimensions?.actionType || '').toLowerCase();
+			if (group.sum) {
+				if (action === 'read') reads += group.sum.requests || 0;
+				else if (action === 'write') writes += group.sum.requests || 0;
+				
+			}
+		}
+		const total = reads + writes;
+		return { ok: true, requests: total, reads, writes };
+	} catch (e) { return { ok: false, reason: 'exception' }; }
+}
+
+async function fetchAccountPlan(accountId, apiToken) {
+	try {
+		const resp = await fetch('https://api.cloudflare.com/client/v4/accounts/' + accountId + '/subscriptions', {
+			headers: { "Authorization": "Bearer " + apiToken, "Content-Type": "application/json" },
+		});
+		if (!resp.ok) return null;
+		const data = await resp.json();
+		if (!data.success || !data.result || data.result.length === 0) return null;
+		const sub = data.result[0];
+		const planName = (sub.plan && sub.plan.name) || (sub.rate_plan && sub.rate_plan.public_name) || '';
+		return { plan: planName, isPaid: sub.plan && sub.plan.is_paid, frequency: sub.frequency };
+	} catch (e) { return null; }
+}
+
+
+async function KV(request, env, txt = 'ADD.txt', guest, config = {}) {
+	const {
+		FileName = DEFAULT_CONFIG.fileName,
+		mytoken = DEFAULT_CONFIG.token,
+		subConverterDisplay = `https://${DEFAULT_SUB_CONVERTER}`,
+		subConverterStateBackend = 'MEMORY',
+		subConfig = DEFAULT_SUB_CONFIG,
+		subRetry = DEFAULT_CONFIG.subRetry,
+		subTimeout = DEFAULT_CONFIG.subTimeout,
+		subApiTimeout = DEFAULT_CONFIG.subApiTimeout,
+		subApiStagger = DEFAULT_CONFIG.subApiStagger,
+		subCache = DEFAULT_CONFIG.subCache,
+		showFailedSub = DEFAULT_CONFIG.showFailedSub,
+		cfAccountId = '',
+		cfApiToken = '',
+		ctx = null,
+		DEBUG = false,
+	} = config;
 	const url = new URL(request.url);
 	try {
 		// POST请求处理
@@ -505,6 +1239,18 @@ async function KV(request, env, txt = 'ADD.txt', guest) {
 			try {
 				const content = await request.text();
 				await env.KV.put(txt, content);
+				
+				// 保存后预热缓存：立即在后台触发常用订阅格式处理，填充多格式 KV 缓存
+				if (ctx && mytoken) {
+					for (const warmingSearch of ['', '?clash', '?singbox']) {
+						const warmingUrl = new URL(request.url);
+						warmingUrl.pathname = '/' + mytoken;
+						warmingUrl.search = warmingSearch;
+						runInBackground(ctx, fetch(warmingUrl.toString(), {
+							headers: { 'User-Agent': 'CF-Workers-SUB/cache-warmer/1.0' }
+						}).catch(() => {}), DEBUG);
+					}
+				}
 				return new Response("保存成功");
 			} catch (error) {
 				console.error('保存KV时发生错误:', error);
@@ -524,6 +1270,55 @@ async function KV(request, env, txt = 'ADD.txt', guest) {
 				content = '读取数据时发生错误: ' + error.message;
 			}
 		}
+		const stats = summarizeLinks(content);
+		let kvUsageBars = '';
+		if (cfAccountId && cfApiToken) {
+			try {
+				const usage = await fetchKvUsage(cfAccountId, cfApiToken);
+				const planInfo = await fetchAccountPlan(cfAccountId, cfApiToken);
+				const isPaid = planInfo && planInfo.isPaid;
+				const readLimit = isPaid ? 10000000 : 100000;
+				const writeLimit = isPaid ? 1000000 : 1000;
+				const planLabel = isPaid ? ' (Paid)' : ' (Free)';
+				if (usage && usage.ok) {
+					const reads = usage.reads || 0;
+					const writes = usage.writes || 0;
+					const total = usage.requests || 0;
+					function buildBar(current, limit) {
+						const pct = limit > 0 ? (current / limit * 100) : 0;
+						const barLen = Math.min(Math.round(pct / 10), 10);
+						const bar = '\u2588'.repeat(barLen) + '\u2591'.repeat(10 - barLen);
+						let color;
+						if (pct < 50) color = '#4CAF50';
+						else if (pct < 80) color = '#FFC107';
+						else color = '#F44336';
+						return { bar, pct: pct.toFixed(1), color };
+					}
+					const rBar = buildBar(reads, readLimit);
+					const wBar = buildBar(writes, writeLimit);
+					kvUsageBars =
+						'---------------------------------------------------------------<br>\n' +
+						'KV \u5168\u8d26\u53f7\u914d\u989d\u4f7f\u7528\uff08\u914d\u989d\u6bcf\u65e5 00:00 UTC \u91cd\u7f6e' + planLabel + '\uff09<br>\n' +
+						'Reads  \u00b7 ' + rBar.bar + ' <span style="color:' + rBar.color + '">' + reads.toLocaleString() + ' / ' + readLimit.toLocaleString() + ' (' + rBar.pct + '%)</span><br>\n' +
+						'Writes \u00b7 ' + wBar.bar + ' <span style="color:' + wBar.color + '">' + writes.toLocaleString() + ' / ' + writeLimit.toLocaleString() + ' (' + wBar.pct + '%)</span><br>\n' +
+						'Total  \u00b7 <span style="color:' + (Number(rBar.pct) > 80 || Number(wBar.pct) > 80 ? '#F44336' : Number(rBar.pct) > 50 || Number(wBar.pct) > 50 ? '#FFC107' : '#4CAF50') + '">' + total.toLocaleString() + ' / ' + (readLimit + writeLimit).toLocaleString() + '</span><br>\n' +
+						'---------------------------------------------------------------<br>';
+				} else if (usage && usage.reason === 'no_data') {
+					kvUsageBars = '---------------------------------------------------------------<br>\n' +
+						'KV \u914d\u989d\u67e5\u8be2\u5931\u8d25: \u6682\u65e0\u4eca\u65e5\u6570\u636e\uff08KV \u5206\u6790\u6709 15-30 \u5206\u949f\u5ef6\u8fdf\uff09<br>\n' +
+						'---------------------------------------------------------------<br>';
+				} else {
+					kvUsageBars = '---------------------------------------------------------------<br>\n' +
+						'KV \u914d\u989d\u67e5\u8be2\u5931\u8d25\uff08' + (usage ? usage.reason : 'unknown') + '\uff09<br>\n' +
+						'---------------------------------------------------------------<br>';
+				}
+			} catch (e) {
+				kvUsageBars = '---------------------------------------------------------------<br>\n' +
+					'KV \u67e5\u8be2\u5f02\u5e38: ' + (e.message || '') + '<br>\n' +
+					'---------------------------------------------------------------<br>';
+			}
+		}
+
 
 		const html = `
 			<!DOCTYPE html>
@@ -531,6 +1326,7 @@ async function KV(request, env, txt = 'ADD.txt', guest) {
 				<head>
 					<title>${FileName} 订阅编辑</title>
 					<meta charset="utf-8">
+					<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'">
 					<meta name="viewport" content="width=device-width, initial-scale=1">
 					<style>
 						body {
@@ -639,11 +1435,20 @@ async function KV(request, env, txt = 'ADD.txt', guest) {
 					################################################################<br>
 					订阅转换配置<br>
 					---------------------------------------------------------------<br>
-					SUBAPI（订阅转换后端）: <strong>${subProtocol}://${subConverter}</strong><br>
+					SUBAPI（订阅转换后端）: <strong>${subConverterDisplay}</strong><br>
+					<!-- SUBAPI STRATEGY: <strong>${SUB_CONVERTER_STRATEGY}</strong><br> -->
+					<!-- SUBAPI STATE: <strong>${subConverterStateBackend}</strong><br> -->
 					SUBCONFIG（订阅转换配置文件）: <strong>${subConfig}</strong><br>
+					<!-- SUBRETRY: <strong>${subRetry}</strong> / SUBTIMEOUT: <strong>${subTimeout}ms</strong><br> -->
+					<!-- SUBAPITIMEOUT: <strong>${subApiTimeout}ms</strong> / SUBAPISTAGGER: <strong>${subApiStagger}ms</strong><br> -->
+					<!-- SUBCACHE: <strong>${subCache}s</strong><br> -->
+					<!-- SHOW_FAILED_SUB: <strong>${showFailedSub ? '1' : '0'}</strong><br> -->
+					VERSION（部署标记）: <strong>${CUSTOM_FIX_VERSION}</strong><br>
+					${kvUsageBars}
 					---------------------------------------------------------------<br>
 					################################################################<br>
-					${FileName} 汇聚订阅编辑: 
+					${FileName} 汇聚订阅编辑:
+					<br>数据统计: <strong>${stats.total}</strong> 行 / 自建节点 <strong>${stats.local}</strong> / 远程订阅 <strong>${stats.remote}</strong><br>
 					<div class="editor-container">
 						${hasKV ? `
 						<textarea class="editor" 
@@ -658,6 +1463,10 @@ async function KV(request, env, txt = 'ADD.txt', guest) {
 					<br>
 					################################################################<br>
 					${decodeURIComponent(atob('dGVsZWdyYW0lMjAlRTQlQkElQTQlRTYlQjUlODElRTclQkUlQTQlMjAlRTYlOEElODAlRTYlOUMlQUYlRTUlQTQlQTclRTQlQkQlQUMlN0UlRTUlOUMlQTglRTclQkElQkYlRTUlOEYlOTElRTclODklOEMhJTNDYnIlM0UKJTNDYSUyMGhyZWYlM0QlMjdodHRwcyUzQSUyRiUyRnQubWUlMkZDTUxpdXNzc3MlMjclM0VodHRwcyUzQSUyRiUyRnQubWUlMkZDTUxpdXNzc3MlM0MlMkZhJTNFJTNDYnIlM0UKLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tJTNDYnIlM0UKZ2l0aHViJTIwJUU5JUExJUI5JUU3JTlCJUFFJUU1JTlDJUIwJUU1JTlEJTgwJTIwU3RhciFTdGFyIVN0YXIhISElM0NiciUzRQolM0NhJTIwaHJlZiUzRCUyN2h0dHBzJTNBJTJGJTJGZ2l0aHViLmNvbSUyRmNtbGl1JTJGQ0YtV29ya2Vycy1TVUIlMjclM0VodHRwcyUzQSUyRiUyRmdpdGh1Yi5jb20lMkZjbWxpdSUyRkNGLVdvcmtlcnMtU1VCJTNDJTJGYSUzRSUzQ2JyJTNFCi0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLSUzQ2JyJTNFCiUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMyUyMw=='))}
+					<br>Modified by <strong>FisheeHei</strong><br>
+					custom-fix repo: <a href="https://github.com/FisheeHei/CF-Workers-SUB" target="_blank" rel="noopener noreferrer">https://github.com/FisheeHei/CF-Workers-SUB</a><br>
+					----------------------------------------------------------------<br>
+					################################################################<br>
 					<br><br>UA: <strong>${request.headers.get('User-Agent')}</strong>
 					<script>
 					function copyToClipboard(text, qrcode) {
@@ -760,6 +1569,7 @@ async function KV(request, env, txt = 'ADD.txt', guest) {
 										updateButtonText('更新保存状态');
 										const now = new Date().toLocaleString();
 										document.title = \`编辑已保存 \${now}\`;
+										textarea.defaultValue = newContent;
 										updateStatus(\`已保存 \${now}\`);
 									})
 									.catch(error => {
@@ -787,10 +1597,10 @@ async function KV(request, env, txt = 'ADD.txt', guest) {
 							}
 						}
 		
-						textarea.addEventListener('blur', saveContent);
+						textarea.addEventListener('blur', () => saveContent(document.querySelector('.save-btn')));
 						textarea.addEventListener('input', () => {
 							clearTimeout(timer);
-							timer = setTimeout(saveContent, 5000);
+							timer = setTimeout(() => saveContent(document.querySelector('.save-btn')), 5000);
 						});
 					}
 
@@ -816,13 +1626,13 @@ async function KV(request, env, txt = 'ADD.txt', guest) {
 		`;
 
 		return new Response(html, {
-			headers: { "Content-Type": "text/html;charset=utf-8" }
+			headers: runtimeHeaders({ "Content-Type": "text/html;charset=utf-8" })
 		});
 	} catch (error) {
 		console.error('处理请求时发生错误:', error);
 		return new Response("服务器错误: " + error.message, {
 			status: 500,
-			headers: { "Content-Type": "text/plain;charset=utf-8" }
+			headers: runtimeHeaders({ "Content-Type": "text/plain;charset=utf-8" })
 		});
 	}
 }
