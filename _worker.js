@@ -26,7 +26,7 @@ https://cfxr.eu.org/getSub
 
 const DEFAULT_SUB_CONVERTER = "SUBAPI.cmliussss.net"; //在线订阅转换后端，目前使用CM的订阅转换功能。支持自建psub 可自行搭建https://github.com/bulianglin/psub
 const DEFAULT_SUB_CONFIG = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; //订阅配置文件
-const CUSTOM_FIX_VERSION = "custom-fix-2026-07-09-full-source-cache-client-fetch-fix-v2";
+const CUSTOM_FIX_VERSION = "custom-fix-2026-08-08-quota-trim";
 // UA 轮换池：首轮用默认UA，重试时依次切换
 // LINK.txt 内存缓存：避免每次请求读KV + 用户编辑后 30s 内生效
 const LINK_TEXT_CACHE = { value: null, ts: 0 };
@@ -499,13 +499,7 @@ export default {
 					"X-Sub-Cache-Age": `${Math.max(0, Math.floor(kvCachedFinal.age || 0))}`,
 				});
 				if (订阅格式 != 'base64' && !userAgent.includes('mozilla')) headers.set("Content-Disposition", `attachment; filename*=utf-8''${encodeURIComponent(FileName)}`);
-				if (kvCachedFinal.stale) {
-					const refreshUrl = new URL(request.url);
-					refreshUrl.searchParams.set('refresh', '1');
-					runInBackground(ctx, fetch(refreshUrl.toString(), {
-						headers: { 'User-Agent': userAgentHeader || 'CF-Workers-SUB/cache-refresh/1.0' }
-					}), DEBUG);
-				}
+				// ponytail: SWR 后台重抓已移除，KV 过期即当 cache miss 走正常链路（下条请求自带刷新，节省 subrequest）
 				return new Response(kvCachedFinal.data, { headers });
 			}
 			let selectedSubConverter = '';
@@ -1032,8 +1026,10 @@ async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
 			const failedUrls = modifiedResponses.filter(r => r.status !== 'fulfilled');
 			for (const failed of failedUrls) {
 				let fallbackOk = false;
-				for (const converter of prioritizeSubConverters(subConverters)) {
-					const proxyUrl = `${converter.subProtocol}://${converter.subConverter}/sub?target=auto&url=${encodeURIComponent(failed.apiUrl)}&insert=false`;
+				// ponytail: 代理回退收敛为单次（仅最健康后端），省 subrequest
+				const fallbackConverter = prioritizeSubConverters(subConverters)[0];
+				if (fallbackConverter) {
+					const proxyUrl = `${fallbackConverter.subProtocol}://${fallbackConverter.subConverter}/sub?target=auto&url=${encodeURIComponent(failed.apiUrl)}&insert=false`;
 					try {
 						const controller = new AbortController();
 						const timer = setTimeout(() => controller.abort(), subTimeout);
@@ -1042,15 +1038,15 @@ async function getSUB(api, 追加UA, userAgentHeader, options = {}) {
 						if (!proxyResp.ok) throw new Error(`SUBAPI HTTP ${proxyResp.status}`);
 						const proxyContent = await proxyResp.text();
 						const fallbackContent = tryDecodeBase64(proxyContent) || (/^[a-z]+:\/\//im.test(proxyContent) ? proxyContent : null);
-						if (!fallbackContent) continue;
-						newapi += fallbackContent + '\n';
-						failed.status = 'fulfilled';
-						failed.value = fallbackContent;
-						staleCache.set(failed.apiUrl, { content: fallbackContent, expiresAt: Date.now() + 86400000 });
-						const statusIndex = subStatus.findIndex(s => s.startsWith(failed.apiUrl));
-						if (statusIndex >= 0) subStatus[statusIndex] = failed.apiUrl + ' SUBAPI_OK';
-						fallbackOk = true;
-						break;
+						if (fallbackContent) {
+							newapi += fallbackContent + '\n';
+							failed.status = 'fulfilled';
+							failed.value = fallbackContent;
+							staleCache.set(failed.apiUrl, { content: fallbackContent, expiresAt: Date.now() + 86400000 });
+							const statusIndex = subStatus.findIndex(s => s.startsWith(failed.apiUrl));
+							if (statusIndex >= 0) subStatus[statusIndex] = failed.apiUrl + ' SUBAPI_OK';
+							fallbackOk = true;
+						}
 					} catch (e) {
 						debugLog(DEBUG, `SUBAPI fallback failed for ${failed.apiUrl}:`, e.message || e);
 					}
